@@ -112,6 +112,7 @@ router.get('/', asyncHandler(async (req, res) => {
          FROM payments pay WHERE pay.hospital_id=$1 GROUP BY pay.visit_id
        )
        SELECT p.id,p.full_name,p.mobile,COUNT(s.id)::int AS visits,
+              (${inRange('p.created_at')}) AS is_new,
               (ARRAY_AGG(s.visit_number ORDER BY s.created_at DESC))[1] AS last_visit_number,
               MAX(s.created_at) AS last_visit_at,
               COALESCE(SUM(ct.amount),0)::numeric(14,2) AS billed_amount,

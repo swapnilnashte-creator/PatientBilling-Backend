@@ -8,7 +8,6 @@ const router = Router();
 
 router.post('/change-password', asyncHandler(async (req, res) => {
   const data = z.object({
-    currentPassword: z.string().min(1),
     newPassword: z.string().min(6).max(100),
   }).parse(req.body);
 
@@ -18,8 +17,6 @@ router.post('/change-password', asyncHandler(async (req, res) => {
     [req.user.id, req.user.hospitalId]
   );
   if (!userQ.rowCount) throw notFound('User not found');
-  const currentMatches = await bcrypt.compare(data.currentPassword, userQ.rows[0].password_hash);
-  if (!currentMatches) throw badRequest('Current password is incorrect');
   const samePassword = await bcrypt.compare(data.newPassword, userQ.rows[0].password_hash);
   if (samePassword) throw badRequest('New password must be different from the current password');
 

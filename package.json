@@ -7,12 +7,19 @@
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "check": "node --check src/server.js",
+    "import:medicines": "node --max-old-space-size=2048 database-scripts/import-indian-medicines.js",
+    "import:medicine-data": "node database-scripts/import-medicine-data.js",
     "create-superuser": "node database-scripts/create-superuser.js",
-    "smoke:super-admin": "node test/smoke-super-admin.js"
+    "smoke:super-admin": "node test/smoke-super-admin.js",
+    "smoke:patient-age": "node test/smoke-patient-age.mjs",
+    "smoke:expenses": "node test/smoke-expenses.mjs",
+    "smoke:prescription": "node test/smoke-prescription.mjs",
+    "smoke:multi-firm-login": "node test/smoke-multi-firm-login.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",
     "cors": "^2.8.5",
+    "csv-parse": "^6.2.1",
     "dotenv": "^17.2.1",
     "express": "^5.1.0",
     "helmet": "^8.1.0",

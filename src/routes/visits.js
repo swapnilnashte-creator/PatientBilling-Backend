@@ -8,8 +8,8 @@ const router = Router();
 
 async function getVisit(client, hospitalId, visitId, lock = false) {
   const q = await client.query(
-    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.address,
-            d.name AS doctor_name
+    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
+            d.name AS doctor_name,d.qualification AS doctor_qualification,d.registration_no AS doctor_registration_no
      FROM visits v
      JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
      JOIN users d ON d.id=v.doctor_id AND d.hospital_id=v.hospital_id
@@ -90,12 +90,25 @@ async function getCorrections(client, hospitalId, visitId) {
 
 async function getVisitDoctors(client, hospitalId, visitId) {
   const q = await client.query(
-    `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,vd.position,vd.status,
+    `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,u.qualification AS doctor_qualification,u.registration_no AS doctor_registration_no,vd.position,vd.status,
             vd.doctor_notes,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
      FROM visit_doctors vd
      JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
      WHERE vd.hospital_id=$1 AND vd.visit_id=$2
      ORDER BY vd.position`,
+    [hospitalId, visitId]
+  );
+  return q.rows;
+}
+
+async function getPrescription(client, hospitalId, visitId) {
+  const q = await client.query(
+    `SELECT pi.id,pi.doctor_id,u.name AS doctor_name,pi.position,pi.medicine_id,pi.name,pi.composition,pi.manufacturer,
+            pi.pack_size,pi.dose,pi.timing,pi.duration_days,pi.note
+     FROM visit_prescription_items pi
+     JOIN users u ON u.id=pi.doctor_id AND u.hospital_id=pi.hospital_id
+     WHERE pi.hospital_id=$1 AND pi.visit_id=$2
+     ORDER BY pi.doctor_id,pi.position`,
     [hospitalId, visitId]
   );
   return q.rows;
@@ -135,10 +148,12 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
 
   const check = await pool.query(
     `SELECT
-       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL) AS patient_ok`,
+       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL) AS patient_ok,
+       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND date_of_birth IS NOT NULL) AS has_age`,
     [data.patientId, req.user.hospitalId]
   );
   if (!check.rows[0].patient_ok) throw badRequest('Invalid patient');
+  if (!check.rows[0].has_age) throw badRequest('Age or date of birth is required to register a visit');
   const visit = await withTransaction(async (client) => {
     await validateDoctors(client, req.user.hospitalId, doctorIds);
     const numberQ = await client.query(
@@ -227,10 +242,12 @@ router.get('/', asyncHandler(async (req, res) => {
   const q = await pool.query(
     `SELECT v.id,v.visit_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
             p.id AS patient_id,p.full_name,p.mobile,d.name AS doctor_name,
-            (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status) ORDER BY vd.position)
+            (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status,'started_at',vd.started_at,'completed_at',vd.completed_at) ORDER BY vd.position)
              FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
              WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id) AS doctors,
             (SELECT COUNT(*)::int FROM visits pv WHERE pv.hospital_id=v.hospital_id AND pv.patient_id=v.patient_id) AS patient_visit_count,
+            (SELECT MAX(pv.created_at) FROM visits pv WHERE pv.hospital_id=v.hospital_id AND pv.patient_id=v.patient_id AND pv.id<>v.id AND pv.created_at<v.created_at) AS previous_visit_at,
+            COUNT(vc.id)::int AS charge_count,v.updated_at,
             lb.name AS left_by_name,
             COALESCE(SUM(vc.amount),0)::numeric(12,2) AS total_amount,
             pay.payment_mode,pay.paid_at
@@ -254,14 +271,66 @@ router.get('/:id', asyncHandler(async (req, res) => {
   if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
   const charges = await getCharges(client, req.user.hospitalId, req.params.id);
   const payment = await client.query(
-    `SELECT id,amount,payment_mode,reference_no,accepted_by,paid_at FROM payments
-     WHERE hospital_id=$1 AND visit_id=$2`,
+    `SELECT p.id,p.amount,p.payment_mode,p.reference_no,p.accepted_by,p.paid_at,u.name AS accepted_by_name
+     FROM payments p LEFT JOIN users u ON u.id=p.accepted_by AND u.hospital_id=p.hospital_id
+     WHERE p.hospital_id=$1 AND p.visit_id=$2`,
     [req.user.hospitalId, req.params.id]
   );
   const corrections = ['PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT','COMPLETED'].includes(visit.status) ? await getCorrections(client, req.user.hospitalId, req.params.id) : [];
   const doctors = await getVisitDoctors(client, req.user.hospitalId, req.params.id);
   const settlement = await getSettlementBreakdown(client, req.user.hospitalId, req.params.id);
-  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement });
+  const prescription = await getPrescription(client, req.user.hospitalId, req.params.id);
+  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription });
+}));
+
+// The most recent earlier prescription for this visit's patient (offered as "copy to this visit").
+router.get('/:id/prescription/last', asyncHandler(async (req, res) => {
+  const visit = await getVisit(pool, req.user.hospitalId, req.params.id);
+  if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+  const last = await pool.query(
+    `SELECT v.id,v.created_at FROM visits v
+     WHERE v.hospital_id=$1 AND v.patient_id=$2 AND v.id<>$3 AND v.created_at<=$4
+       AND EXISTS (SELECT 1 FROM visit_prescription_items pi WHERE pi.hospital_id=v.hospital_id AND pi.visit_id=v.id)
+     ORDER BY v.created_at DESC,v.id DESC LIMIT 1`,
+    [req.user.hospitalId, visit.patient_id, visit.id, visit.created_at]
+  );
+  if (!last.rowCount) return res.json(null);
+  const items = await getPrescription(pool, req.user.hospitalId, last.rows[0].id);
+  res.json({ visitId: Number(last.rows[0].id), date: last.rows[0].created_at, doctorName: items[0]?.doctor_name, items });
+}));
+
+const prescriptionItemSchema = z.object({
+  medicineId: z.coerce.number().int().positive().nullable().optional(),
+  name: z.string().trim().min(1).max(200),
+  composition: z.string().trim().max(300).optional().default(''),
+  manufacturer: z.string().trim().max(200).optional().default(''),
+  packSize: z.string().trim().max(120).optional().default(''),
+  dose: z.string().trim().max(40).optional().default(''),
+  timing: z.enum(['BEFORE_FOOD', 'AFTER_FOOD', 'ANY']).optional().default('ANY'),
+  durationDays: z.coerce.number().int().min(1).max(365).nullable().optional(),
+  note: z.string().trim().max(200).optional().default(''),
+});
+
+// Replaces the consulting doctor's medicine list for this visit (the screen saves the whole list as it changes).
+// The assigned doctor or the hospital admin (who runs the consultation screen in small clinics) can edit it; it is always stored under the consulting doctor.
+router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req, res) => {
+  const data = z.object({ items: z.array(prescriptionItemSchema).max(30) }).parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
+    if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+    if (!['WITH_DOCTOR','PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT','COMPLETED'].includes(visit.status)) throw badRequest('A prescription can be written once the patient has started seeing the doctor');
+    await client.query(`DELETE FROM visit_prescription_items WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
+    for (let index = 0; index < data.items.length; index += 1) {
+      const item = data.items[index];
+      await client.query(
+        `INSERT INTO visit_prescription_items(hospital_id,visit_id,doctor_id,position,medicine_id,name,composition,manufacturer,pack_size,dose,timing,duration_days,note)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+        [req.user.hospitalId, visit.id, visit.doctor_id, index + 1, item.medicineId || null, item.name, item.composition, item.manufacturer, item.packSize, item.dose, item.timing, item.durationDays || null, item.note]
+      );
+    }
+    return getPrescription(client, req.user.hospitalId, visit.id);
+  });
+  res.json({ prescription: result });
 }));
 
 router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {

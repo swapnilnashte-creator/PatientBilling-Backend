@@ -3,26 +3,36 @@ import { z } from 'zod';
 import { pool } from '../db.js';
 import { asyncHandler, notFound } from '../utils.js';
 import { allow } from '../middleware/auth.js';
+import { mobileSchema } from '../mobile.js';
 
 const router = Router();
 
 const patientSchema = z.object({
   fullName: z.string().min(2).max(160),
-  mobile: z.string().min(5).max(20),
+  mobile: mobileSchema,
   gender: z.enum(['MALE','FEMALE','OTHER','PREFER_NOT_TO_SAY']).nullable().optional(),
   dateOfBirth: z.string().date().nullable().optional(),
+  age: z.number().int().min(0).max(120).nullable().optional(),
   address: z.string().max(1000).nullable().optional(),
-});
+})
+  // an exact birth date, or just the age in years (stored as an estimated birth date)
+  .refine(d => d.dateOfBirth || (d.age !== null && d.age !== undefined), { message: 'Age or date of birth is required', path: ['age'] })
+  .refine(d => !d.dateOfBirth || d.dateOfBirth <= new Date(Date.now() + 864e5).toISOString().slice(0, 10), { message: 'Date of birth cannot be in the future', path: ['dateOfBirth'] });
+
+// date_of_birth = the given date, or today minus the age when only an age was given
+const dobSql = (dobParam, ageParam) => `COALESCE($${dobParam}::date,(CURRENT_DATE-($${ageParam}::int*INTERVAL '1 year'))::date)`;
 
 router.get('/search', asyncHandler(async (req, res) => {
   const term = String(req.query.q || '').trim();
   if (!term) return res.json([]);
   const q = await pool.query(
-    `SELECT id,full_name,mobile,gender,date_of_birth,address
-     FROM patients
-     WHERE hospital_id=$1 AND deleted_at IS NULL
-       AND (mobile ILIKE $2 OR full_name ILIKE $2)
-     ORDER BY updated_at DESC LIMIT 20`,
+    `SELECT p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
+            (SELECT COUNT(*)::int FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS visit_count,
+            (SELECT MAX(v.created_at) FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS last_visit_at
+     FROM patients p
+     WHERE p.hospital_id=$1 AND p.deleted_at IS NULL
+       AND (p.mobile ILIKE $2 OR p.full_name ILIKE $2)
+     ORDER BY p.updated_at DESC LIMIT 20`,
     [req.user.hospitalId, `%${term}%`]
   );
   res.json(q.rows);
@@ -31,10 +41,10 @@ router.get('/search', asyncHandler(async (req, res) => {
 router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = patientSchema.parse(req.body);
   const q = await pool.query(
-    `INSERT INTO patients(hospital_id,full_name,mobile,gender,date_of_birth,address,created_by,updated_by)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$7)
-     RETURNING id,full_name,mobile,gender,date_of_birth,address`,
-    [req.user.hospitalId, data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.address || null, req.user.id]
+    `INSERT INTO patients(hospital_id,full_name,mobile,gender,date_of_birth,dob_estimated,address,created_by,updated_by)
+     VALUES($1,$2,$3,$4,${dobSql(5, 6)},$5::date IS NULL,$7,$8,$8)
+     RETURNING id,full_name,mobile,gender,date_of_birth,dob_estimated,address`,
+    [req.user.hospitalId, data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id]
   );
   res.status(201).json(q.rows[0]);
 }));
@@ -42,10 +52,10 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
 router.put('/:id', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = patientSchema.parse(req.body);
   const q = await pool.query(
-    `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=$4,address=$5,updated_by=$6,updated_at=NOW()
-     WHERE id=$7 AND hospital_id=$8 AND deleted_at IS NULL
-     RETURNING id,full_name,mobile,gender,date_of_birth,address`,
-    [data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.address || null, req.user.id, req.params.id, req.user.hospitalId]
+    `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=${dobSql(4, 5)},dob_estimated=$4::date IS NULL,address=$6,updated_by=$7,updated_at=NOW()
+     WHERE id=$8 AND hospital_id=$9 AND deleted_at IS NULL
+     RETURNING id,full_name,mobile,gender,date_of_birth,dob_estimated,address`,
+    [data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, req.params.id, req.user.hospitalId]
   );
   if (!q.rowCount) throw notFound('Patient not found');
   res.json(q.rows[0]);
@@ -53,7 +63,7 @@ router.put('/:id', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) 
 
 router.get('/:id/history', asyncHandler(async (req, res) => {
   const patient = await pool.query(
-    `SELECT id,full_name,mobile,gender,date_of_birth,address FROM patients
+    `SELECT id,full_name,mobile,gender,date_of_birth,dob_estimated,address FROM patients
      WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL`,
     [req.params.id, req.user.hospitalId]
   );

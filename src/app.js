@@ -12,6 +12,9 @@ import dashboardRoutes from './routes/dashboard.js';
 import hospitalRoutes from './routes/hospital.js';
 import accountRoutes from './routes/account.js';
 import reportRoutes from './routes/reports.js';
+import medicineRoutes from './routes/medicines.js';
+import expenseRoutes from './routes/expenses.js';
+import subscriptionRoutes from './routes/subscription.js';
 import superAdminRoutes from './routes/superAdmin.js';
 import { auth } from './middleware/auth.js';
 
@@ -56,10 +59,13 @@ app.use('/api/dashboard', auth, dashboardRoutes);
 app.use('/api/hospital', auth, hospitalRoutes);
 app.use('/api/account', auth, accountRoutes);
 app.use('/api/reports', auth, reportRoutes);
+app.use('/api/medicines', auth, medicineRoutes);
+app.use('/api/expenses', auth, expenseRoutes);
+app.use('/api/subscription', auth, subscriptionRoutes);
 app.use('/api/super-admin', auth, superAdminRoutes);
 
 app.use((err, _req, res, _next) => {
-  if (err?.name === 'ZodError') return res.status(400).json({ message: 'Invalid input', details: err.issues });
+  if (err?.name === 'ZodError') return res.status(400).json({ message: err.issues?.[0]?.message || 'Invalid input', details: err.issues });
   if (err?.code === '23505') return res.status(409).json({ message: 'This record already exists' });
   console.error(err);
   res.status(err.status || 500).json({ message: err.message || 'Internal server error' });

@@ -24,9 +24,10 @@ function assert(condition, message) {
 
 try {
   const hash = await bcrypt.hash(password, 4);
+  const superMobile = `8${String(Date.now()).slice(-9)}`;
   const superQ = await pool.query(
-    `INSERT INTO platform_superusers(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,email`,
-    ['Super Admin Smoke Test', `super-smoke-${suffix}@example.test`, hash]
+    `INSERT INTO platform_superusers(name,mobile,email,password_hash) VALUES($1,$2,$3,$4) RETURNING id,mobile`,
+    ['Super Admin Smoke Test', superMobile, `super-smoke-${suffix}@example.test`, hash]
   );
   superuserId = superQ.rows[0].id;
   const hospitalQ = await pool.query(
@@ -34,17 +35,23 @@ try {
     [`Super Admin Smoke Hospital ${suffix}`, '0000000000']
   );
   hospitalId = hospitalQ.rows[0].id;
+  const smokeMobile = `7${String(Date.now()).slice(-9)}`;
   const adminQ = await pool.query(
-    `INSERT INTO users(hospital_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,'ADMIN') RETURNING id`,
-    [hospitalId, 'Smoke Hospital Admin', `hospital-smoke-${suffix}@example.test`, hash]
+    `INSERT INTO users(hospital_id,name,mobile,email,password_hash,role) VALUES($1,$2,$3,$4,$5,'ADMIN') RETURNING id`,
+    [hospitalId, 'Smoke Hospital Admin', smokeMobile, `hospital-smoke-${suffix}@example.test`, hash]
   );
   adminId = adminQ.rows[0].id;
 
   const login = await request('/auth/login', {
-    method: 'POST', body: JSON.stringify({ email: superQ.rows[0].email, password }),
+    method: 'POST', body: JSON.stringify({ mobile: superQ.rows[0].mobile, password }),
   });
   assert(login.response.ok && login.body.user?.role === 'SUPER_ADMIN', 'Super Admin login failed');
   const superHeaders = { Authorization: `Bearer ${login.body.token}` };
+
+  const mobileLogin = await request('/auth/login', {
+    method: 'POST', body: JSON.stringify({ mobile: smokeMobile, password }),
+  });
+  assert(mobileLogin.response.ok && mobileLogin.body.user?.role === 'ADMIN', 'Hospital Admin mobile login failed');
 
   const list = await request('/super-admin/hospitals', { headers: superHeaders });
   assert(list.response.ok && list.body.some(item => Number(item.id) === Number(hospitalId)), 'Hospital listing failed');

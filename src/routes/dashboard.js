@@ -30,7 +30,7 @@ router.get('/', asyncHandler(async (req, res) => {
     `SELECT
       COUNT(*) FILTER (WHERE status='WAITING_FOR_DOCTOR')::int AS waiting,
       COUNT(*) FILTER (WHERE status='WITH_DOCTOR')::int AS with_doctor,
-      COUNT(*) FILTER (WHERE status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT'))::int AS payment_pending,
+      COUNT(*) FILTER (WHERE status='PAYMENT_PENDING')::int AS payment_pending,
       COUNT(*) FILTER (WHERE status='LEFT_BEFORE_DOCTOR')::int AS left_before_doctor,
       COUNT(*) FILTER (WHERE status='LEFT_WITHOUT_PAYMENT')::int AS left_without_payment,
       COUNT(*) FILTER (WHERE status='COMPLETED')::int AS completed,

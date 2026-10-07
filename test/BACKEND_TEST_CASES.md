@@ -13,8 +13,8 @@ Base URL example: `http://localhost:4000/api`
 | BE-A03 | Register new hospital | Five default V1 billing items are created automatically for that hospital. |
 | BE-A04 | Invalid registration email | 400 validation error. |
 | BE-A05 | Password < 6 characters | 400 validation error. |
-| BE-A06 | Duplicate globally unique email | 409; transaction must not leave an orphan hospital. |
-| BE-A07 | Valid login | 200 with JWT and user/hospital metadata. |
+| BE-A06 | Duplicate email inside one firm | 409; transaction must not leave an orphan hospital. The same email may exist in another firm. |
+| BE-A07 | Valid hospital-user mobile login | 200 with JWT and user/hospital metadata. |
 | BE-A08 | Wrong password | Authentication rejected. |
 | BE-A09 | Inactive user login | Rejected. |
 | BE-A10 | Deleted user login | Rejected. |
@@ -22,6 +22,13 @@ Base URL example: `http://localhost:4000/api`
 | BE-A12 | Protected endpoint without token | 401. |
 | BE-A13 | Protected endpoint with malformed token | 401. |
 | BE-A14 | Token includes subject/hospital/role scope | Subsequent request resolves correct `req.user`. |
+| BE-A15 | Platform Super Admin mobile login | 200 with Super Admin JWT and metadata. |
+| BE-A16 | Login with an email address | 400 validation error; only mobile login is supported. |
+| BE-A17 | Duplicate or invalid mobile identity | Login is rejected without revealing account existence. |
+| BE-A18 | Valid mobile/password in two firms | Returns a five-minute selection token and only the password-validated firm choices; no full session token. |
+| BE-A19 | `POST /auth/select-firm` with offered firm | Returns a session scoped to the selected firm. |
+| BE-A20 | Select an unoffered/inactive firm or use an expired/invalid selection token | Rejected; no session is issued. |
+| BE-A21 | Same mobile in multiple firms but different passwords | Only firms whose stored password matches are offered. |
 
 ## B. Users API
 
@@ -41,6 +48,10 @@ Base URL example: `http://localhost:4000/api`
 | BE-B12 | `POST /users/:id/reset-password` valid | Password hash changes; new password works. |
 | BE-B13 | Reset other-hospital user | 404/not changed. |
 | BE-B14 | User list tenant filter | Hospital A token never receives Hospital B users. |
+| BE-B15 | Create user without valid 10-digit mobile | 400. |
+| BE-B16 | Create user with mobile already used inside that firm | 409; the same mobile remains valid in another firm. |
+| BE-B17 | `PATCH /users/:id/mobile` firm-unique valid number | `users.mobile` updates and the new number is used for login. |
+| BE-B18 | Update other-hospital user mobile | 404/not changed. |
 
 ## C. Billing Items API and Migration
 
