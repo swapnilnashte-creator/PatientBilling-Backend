@@ -16,6 +16,10 @@ const shape = (row, matched) => ({
   price: Number(row.price),
   matched,
 });
+// Custom medicines (typed in by a doctor, not in the catalogue) are shared with the whole hospital:
+// anything already used on a prescription at this hospital is offered to every doctor there.
+const CUSTOM_LIMIT = 4;
+const customShape = row => ({ id: null, name: row.name, composition: '', manufacturer: '', packSize: '', price: null, matched: 'custom', custom: true });
 const COLUMNS = 'source_id,name,price,manufacturer_name,pack_size_label,short_composition1,short_composition2';
 
 // Type-ahead over the global medicine catalogue: names that start with the text come first,
@@ -26,6 +30,17 @@ router.get('/search', asyncHandler(async (req, res) => {
   if (text.length < 2) return res.json({ items: [], prefixTotal: 0 });
   const prefix = `${likeEscape(text)}%`;
   const contains = `%${likeEscape(text)}%`;
+
+  const customRows = await pool.query(
+    `SELECT name FROM (
+       SELECT DISTINCT ON (lower(name)) name,lower(name) AS lname,id
+       FROM visit_prescription_items
+       WHERE hospital_id=$1 AND medicine_id IS NULL AND lower(name) LIKE $2
+       ORDER BY lower(name),id DESC
+     ) x ORDER BY (lname LIKE $3) DESC,length(name),name LIMIT $4`,
+    [req.user.hospitalId, contains, prefix, CUSTOM_LIMIT]
+  );
+  const customItems = customRows.rows.map(customShape);
 
   const [starts, total] = await Promise.all([
     pool.query(
@@ -47,7 +62,7 @@ router.get('/search', asyncHandler(async (req, res) => {
     );
     items.push(...more.rows.map(row => shape(row, 'ingredient')));
   }
-  res.json({ items, prefixTotal: total.rows[0].n });
+  res.json({ items: [...customItems, ...items].slice(0, limit), prefixTotal: total.rows[0].n });
 }));
 
 // The doctor's own most-used medicines (the admin sees the hospital's), with the dose / timing / duration they used last time.
