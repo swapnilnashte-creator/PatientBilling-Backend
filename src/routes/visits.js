@@ -8,7 +8,7 @@ const router = Router();
 
 async function getVisit(client, hospitalId, visitId, lock = false) {
   const q = await client.query(
-    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
+    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,p.qr_code AS patient_qr_code,
             d.name AS doctor_name,d.qualification AS doctor_qualification,d.registration_no AS doctor_registration_no
      FROM visits v
      JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
@@ -319,6 +319,16 @@ router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req
     const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
     if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
     if (!['WITH_DOCTOR','PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT','COMPLETED'].includes(visit.status)) throw badRequest('A prescription can be written once the patient has started seeing the doctor');
+    // a medicine another doctor already prescribed on this visit cannot be prescribed again
+    const others = await client.query(
+      `SELECT pi.medicine_id,pi.name,u.name AS doctor_name FROM visit_prescription_items pi JOIN users u ON u.id=pi.doctor_id AND u.hospital_id=pi.hospital_id
+       WHERE pi.hospital_id=$1 AND pi.visit_id=$2 AND pi.doctor_id<>$3`,
+      [req.user.hospitalId, visit.id, visit.doctor_id]
+    );
+    for (const item of data.items) {
+      const taken = others.rows.find(o => (o.medicine_id && item.medicineId && Number(o.medicine_id) === Number(item.medicineId)) || String(o.name).trim().toLowerCase() === item.name.trim().toLowerCase());
+      if (taken) throw badRequest(`${item.name} is already prescribed by ${taken.doctor_name} in this visit, so it cannot be added again.`);
+    }
     await client.query(`DELETE FROM visit_prescription_items WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
     for (let index = 0; index < data.items.length; index += 1) {
       const item = data.items[index];

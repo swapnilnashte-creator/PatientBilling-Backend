@@ -5,7 +5,7 @@ import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { mobileSchema } from '../mobile.js';
-import { autoTopUp, deactivationImpact, doctorImpact } from '../billing/doctors.js';
+import { autoTopUp, deactivationImpact, doctorImpact, refreshOpenMonthlyInvoice } from '../billing/doctors.js';
 
 const router = Router();
 router.use(allow('ADMIN'));
@@ -69,7 +69,8 @@ router.post('/', asyncHandler(async (req, res) => {
          letterhead_order=COALESCE((SELECT MAX(letterhead_order) FROM users WHERE hospital_id=$1),0)+1 WHERE id=$2`, [req.user.hospitalId, q.rows[0].id]);
     }
     const topUp = data.role === 'DOCTOR' ? await autoTopUp(client, req.user.hospitalId) : null;
-    return { ...q.rows[0], topUp: topUp && { invoiceNo: topUp.invoiceNo, total: topUp.total, doctors: topUp.doctors } };
+    const invoiceUpdated = data.role === 'DOCTOR' ? await refreshOpenMonthlyInvoice(client, req.user.hospitalId) : null;
+    return { ...q.rows[0], topUp: topUp && { invoiceNo: topUp.invoiceNo, total: topUp.total, doctors: topUp.doctors }, invoiceUpdated };
   });
   res.status(201).json(created);
 }));
@@ -109,7 +110,8 @@ router.patch('/:id/status', asyncHandler(async (req, res) => {
       [active, req.params.id, req.user.hospitalId]
     );
     const topUp = reactivatingDoctor ? await autoTopUp(client, req.user.hospitalId) : null;
-    return { ...q.rows[0], topUp: topUp && { invoiceNo: topUp.invoiceNo, total: topUp.total, doctors: topUp.doctors } };
+    const invoiceUpdated = target.role === 'DOCTOR' ? await refreshOpenMonthlyInvoice(client, req.user.hospitalId) : null;
+    return { ...q.rows[0], topUp: topUp && { invoiceNo: topUp.invoiceNo, total: topUp.total, doctors: topUp.doctors }, invoiceUpdated };
   });
   if (result.confirm) return needsConfirm(res, result.confirm);
   res.json(result);

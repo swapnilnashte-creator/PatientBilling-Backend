@@ -38,6 +38,31 @@ router.get('/search', asyncHandler(async (req, res) => {
   res.json(q.rows);
 }));
 
+// Reception scans the QR printed on a returning patient's bill, pad or prescription: the code resolves to the patient of THIS hospital only.
+router.get('/by-code/:code', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req, res) => {
+  const code = String(req.params.code || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{16}$/.test(code)) throw notFound('Patient not found');
+  const q = await pool.query(
+    `SELECT p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
+            (SELECT COUNT(*)::int FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS visit_count,
+            (SELECT MAX(v.created_at) FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS last_visit_at,
+            (SELECT v.status FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id AND v.status IN ('WAITING_FOR_DOCTOR','WITH_DOCTOR','PAYMENT_PENDING') ORDER BY v.id DESC LIMIT 1) AS open_visit_status
+     FROM patients p WHERE p.hospital_id=$1 AND p.qr_code=$2 AND p.deleted_at IS NULL`,
+    [req.user.hospitalId, code]
+  );
+  if (!q.rowCount) throw notFound('Patient not found');
+  const row = q.rows[0];
+  if (req.user.role === 'DOCTOR') {
+    // a doctor scans to open this patient's visit with them: only visits assigned to this doctor, from the last two days (the screen keeps today's)
+    const visits = await pool.query(
+      `SELECT id,status,created_at FROM visits WHERE hospital_id=$1 AND patient_id=$2 AND doctor_id=$3 AND created_at >= NOW() - INTERVAL '2 days' ORDER BY id DESC`,
+      [req.user.hospitalId, row.id, req.user.id]
+    );
+    row.recent_visits = visits.rows;
+  }
+  res.json(row);
+}));
+
 router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = patientSchema.parse(req.body);
   const q = await pool.query(

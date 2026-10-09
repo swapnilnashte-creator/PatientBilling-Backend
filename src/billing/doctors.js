@@ -89,12 +89,50 @@ export async function doctorImpact(client, hospitalId, { candidateId = null, tod
   const before = now.count; const after = before + 1;
   const quote = (n) => (n >= 1 ? buildQuote({ plans, startDate: h.start_date, cycle: 'MONTHLY', periodStart, doctors: n, ...gst }) : null);
   const qb = quote(before); const qa = quote(after);
+  const open = await openMonthlyInvoice(client, hospitalId, today);
+  const openInvoice = open ? { invoiceNo: open.invoice_no, totalBefore: Number(open.total), totalAfter: quoteForInvoice(plans, h.start_date, open, after).total } : null;
   return {
-    mode: 'MONTHLY', requiresConfirm: true, cycle: 'MONTHLY', before, after, periodStart, periodEnd,
+    openInvoice, mode: 'MONTHLY', requiresConfirm: true, cycle: 'MONTHLY', before, after, periodStart, periodEnd,
     rateBefore: qb?.rate ?? null, rateAfter: qa.rate, tierAfter: qa.tierLabel,
     monthlyBefore: qb ? round2(qb.subtotal) : 0, monthlyAfter: round2(qa.subtotal), gstApplicable: h.gst_effective, gstRate: h.gst_rate,
     totalAfter: qa.total,
   };
+}
+
+/** A monthly invoice that is issued but not yet paid, for the billing month that is running today. */
+async function openMonthlyInvoice(client, hospitalId, today, lock = false) {
+  const q = await client.query(
+    `SELECT id,invoice_no,doctors,period_start::text AS period_start,period_end::text AS period_end,adjustment,gst_applicable,gst_rate,total,notes
+     FROM platform_invoices
+     WHERE hospital_id=$1 AND cycle='MONTHLY' AND kind='PERIOD' AND status='ISSUED' AND period_start<=$2::date AND period_end>=$2::date
+     ORDER BY id DESC LIMIT 1 ${lock ? 'FOR UPDATE' : ''}`,
+    [hospitalId, today]
+  );
+  return q.rows[0] || null;
+}
+
+const quoteForInvoice = (plans, startDate, inv, doctors) => buildQuote({
+  plans, startDate, cycle: 'MONTHLY', periodStart: inv.period_start, doctors,
+  adjustment: Number(inv.adjustment || 0), gstApplicable: Boolean(inv.gst_applicable), gstRate: num(inv.gst_rate) ?? 18,
+});
+
+/** A monthly invoice that is still unpaid follows the doctors of its month: when a doctor is added (or removed) during
+ *  that month, the invoice is re-priced right away (doctor count, tier rate, GST and total). Paid invoices never change. */
+export async function refreshOpenMonthlyInvoice(client, hospitalId, today = todayString()) {
+  const h = await hospitalFor(client, hospitalId, true);
+  if (!h || h.billing_cycle !== 'MONTHLY') return null;
+  const inv = await openMonthlyInvoice(client, hospitalId, today, true);
+  if (!inv) return null;
+  const bill = await billableDoctors(client, hospitalId, inv.period_start, inv.period_end, today);
+  if (bill.count < 1 || bill.count === Number(inv.doctors)) return null;
+  const q = quoteForInvoice(await plansOf(client), h.start_date, inv, bill.count);
+  const note = `Updated automatically on ${today}: ${inv.doctors} → ${bill.count} doctors`;
+  await client.query(
+    `UPDATE platform_invoices SET doctors=$2,rate_year=$3,base_rate=$4,tier_label=$5,discount_pct=$6,rate=$7,subtotal=$8,adjustment=$9,gst_amount=$10,total=$11,
+        notes=CASE WHEN notes IS NULL OR notes='' THEN $12 ELSE notes || E'\\n' || $12 END,updated_at=NOW() WHERE id=$1`,
+    [inv.id, q.doctors, q.rateYear, q.baseRate, q.tierLabel, q.discountPct, q.rate, q.subtotal, q.adjustment, q.gstAmount, q.total, note]
+  );
+  return { id: inv.id, invoiceNo: inv.invoice_no, doctorsBefore: Number(inv.doctors), doctorsAfter: bill.count, totalBefore: Number(inv.total), total: q.total };
 }
 
 /** Called in the same transaction that activates a doctor. Bills the annual top-up right away when the cap is exceeded. */
@@ -142,8 +180,10 @@ export async function deactivationImpact(client, hospitalId, doctorId, today = t
   const before = now.count; const after = stillCharged ? before : before - 1;
   const quote = (n) => (n >= 1 ? buildQuote({ plans, startDate: h.start_date, cycle: 'MONTHLY', periodStart, doctors: n, ...gst }) : null);
   const qb = quote(before); const qa = quote(after);
+  const open = after >= 1 ? await openMonthlyInvoice(client, hospitalId, today) : null;
+  const openInvoice = open && after !== Number(open.doctors) ? { invoiceNo: open.invoice_no, totalBefore: Number(open.total), totalAfter: quoteForInvoice(plans, h.start_date, open, after).total } : null;
   return {
-    mode: 'REMOVE_MONTHLY', requiresConfirm: true, cycle: 'MONTHLY', stillCharged, before, after, periodStart, periodEnd,
+    openInvoice, mode: 'REMOVE_MONTHLY', requiresConfirm: true, cycle: 'MONTHLY', stillCharged, before, after, periodStart, periodEnd,
     rateBefore: qb?.rate ?? null, rateAfter: qa?.rate ?? null, tierAfter: qa?.tierLabel ?? null,
     monthlyBefore: qb ? round2(qb.subtotal) : 0, monthlyAfter: qa ? round2(qa.subtotal) : 0, gstApplicable: h.gst_effective, gstRate: h.gst_rate,
   };
