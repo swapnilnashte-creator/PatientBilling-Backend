@@ -10,6 +10,7 @@
     "import:medicines": "node --max-old-space-size=2048 database-scripts/import-indian-medicines.js",
     "import:medicine-data": "node database-scripts/import-medicine-data.js",
     "create-superuser": "node database-scripts/create-superuser.js",
+    "wipe-data": "node database-scripts/wipe-data.js",
     "smoke:super-admin": "node test/smoke-super-admin.js",
     "smoke:patient-age": "node test/smoke-patient-age.mjs",
     "smoke:expenses": "node test/smoke-expenses.mjs",

@@ -31,3 +31,6 @@ Thumbs.db
 *.local
 *.tmp
 *.swp
+
+# Data backups made by wipe-data (contain patient data)
+backups/
