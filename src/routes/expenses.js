@@ -5,11 +5,11 @@ import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, notFound } from '../utils.js';
 
 // Hospital expenses. Admin: everything. Reception: see the list and add entries (no edit / delete, no totals of income).
-// Doctors have no access. Paid CareBill subscription invoices are listed automatically (admin only, read-only).
+// Doctors have no access. Paid DhaCare subscription invoices are listed automatically (admin only, read-only).
 const router = Router();
 router.use(allow('ADMIN', 'RECEPTIONIST'));
 
-const SUBSCRIPTION = { id: 'subscription', name: 'CareBill subscription', color: '#2e90fa' };
+const SUBSCRIPTION = { id: 'subscription', name: 'DhaCare subscription', color: '#2e90fa' };
 const DEFAULT_CATEGORIES = [
   ['Salaries', '#079455'], ['Rent', '#7a5af8'], ['Medical supplies', '#3f51b5'], ['Utilities', '#e77919'],
   ['Lab & outsourced', '#06aed4'], ['Equipment & repairs', '#667085'], ['Marketing', '#ee46bc'], ['Software', '#0e9384'], ['Other', '#98a2b3'],
@@ -92,11 +92,11 @@ router.get('/', asyncHandler(async (req, res) => {
     const sp = [req.user.hospitalId]; let sw = `hospital_id=$1 AND status='PAID' AND paid_on IS NOT NULL`;
     if (from) { sp.push(from); sw += ` AND paid_on>=$${sp.length}`; }
     if (to) { sp.push(to); sw += ` AND paid_on<=$${sp.length}`; }
-    if (search) { sp.push(`%${search}%`); sw += ` AND ('CareBill subscription ' || invoice_no) ILIKE $${sp.length}`; }
+    if (search) { sp.push(`%${search}%`); sw += ` AND ('DhaCare subscription ' || invoice_no) ILIKE $${sp.length}`; }
     const inv = await pool.query(`SELECT id,invoice_no,to_char(paid_on,'YYYY-MM-DD') AS date,COALESCE(paid_amount,total) AS amount,payment_mode FROM platform_invoices WHERE ${sw} ORDER BY paid_on DESC,id DESC`, sp);
     items = items.concat(inv.rows.map(row => ({
       id: `inv-${row.id}`, kind: 'SUBSCRIPTION', date: row.date, amount: Number(row.amount), categoryId: SUBSCRIPTION.id, categoryName: SUBSCRIPTION.name, color: SUBSCRIPTION.color,
-      paidTo: 'CareBill', paymentMode: row.payment_mode || '', note: `Invoice ${row.invoice_no}`, createdByName: '', invoiceId: String(row.id),
+      paidTo: 'DhaCare', paymentMode: row.payment_mode || '', note: `Invoice ${row.invoice_no}`, createdByName: '', invoiceId: String(row.id),
     })));
     items.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
   }

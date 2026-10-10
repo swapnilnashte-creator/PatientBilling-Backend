@@ -192,12 +192,12 @@ try {
   await B('DELETE', `/rates/${sched3.data.id}`, { reason: 'Rate lock check done' });
 
   // ---------- company details + audit ----------
-  const noGstin = await B('PUT', '/company', { name: 'CareBill Platform', address: 'Pune', gstin: 'BAD', paymentDetails: '' });
+  const noGstin = await B('PUT', '/company', { name: 'DhaCare Platform', address: 'Pune', gstin: 'BAD', paymentDetails: '' });
   ok('Company: invalid GSTIN refused (400)', noGstin.status === 400);
-  const comp = await B('PUT', '/company', { name: 'CareBill Platform', address: 'Test address, Pune', gstin: '27AAAPD1234C1Z9', paymentDetails: 'Bank: Test Bank · A/c 000111222' });
+  const comp = await B('PUT', '/company', { name: 'DhaCare Platform', address: 'Test address, Pune', gstin: '27AAAPD1234C1Z9', paymentDetails: 'Bank: Test Bank · A/c 000111222' });
   const compGet = await B('GET', '/company');
   ok('Company: details saved and returned on invoices', comp.status === 200 && compGet.data.gstin === '27AAAPD1234C1Z9' && (await B('GET', `/invoices/${inv1.data.id}`)).data.company.address === 'Test address, Pune');
-  await B('PUT', '/company', { name: 'CareBill Platform', address: '', gstin: '', paymentDetails: '' });
+  await B('PUT', '/company', { name: 'DhaCare Platform', address: '', gstin: '', paymentDetails: '' });
   const audit = await call('GET', '/super-admin/audit', undefined, T);
   const acts = new Set(audit.data.map(a => a.action));
   ok('Audit: rate, settings and invoice actions are recorded', ['RATE_SCHEDULED', 'RATE_UPDATED', 'RATE_CANCELLED', 'HOSPITAL_BILLING_UPDATED', 'INVOICE_ISSUED', 'INVOICE_PAID', 'INVOICE_CANCELLED', 'COMPANY_DETAILS_UPDATED'].every(a => acts.has(a)), [...acts].join(','));

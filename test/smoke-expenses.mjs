@@ -26,7 +26,7 @@ try {
   const mine = await call('POST', '/expenses/categories', { name: 'Ambulance fuel', color: '#ff0000' }, admin);
   check('admin can add their own category', mine.status === 201 && mine.data.name === 'Ambulance fuel');
   check('duplicate category name is refused', (await call('POST', '/expenses/categories', { name: 'ambulance FUEL' }, admin)).status === 409);
-  check('the subscription name is reserved', (await call('POST', '/expenses/categories', { name: 'CareBill subscription' }, admin)).status === 400);
+  check('the subscription name is reserved', (await call('POST', '/expenses/categories', { name: 'DhaCare subscription' }, admin)).status === 400);
   check('reception cannot add categories', (await call('POST', '/expenses/categories', { name: 'Tea' }, rec)).status === 403);
 
   const base = { date: today, amount: 14200, categoryId: Number(mine.data.id), paidTo: 'Pune Fuel', paymentMode: 'UPI', note: 'Diesel' };
@@ -63,13 +63,13 @@ try {
   await inv('PAID', today);
   const withSub = (await call('GET', '/expenses', null, admin)).data;
   const sub = withSub.items.find(i => i.kind === 'SUBSCRIPTION');
-  check('once paid, the subscription appears automatically', sub && sub.amount === 590 && sub.categoryName === 'CareBill subscription' && sub.date === today && withSub.total === 15000 + 500 + 590, JSON.stringify(sub));
+  check('once paid, the subscription appears automatically', sub && sub.amount === 590 && sub.categoryName === 'DhaCare subscription' && sub.date === today && withSub.total === 15000 + 500 + 590, JSON.stringify(sub));
   check('reception does not see platform billing', (await call('GET', '/expenses', null, rec)).data.items.every(i => i.kind !== 'SUBSCRIPTION'));
   check('subscription can be filtered as a category', (await call('GET', '/expenses?categoryId=subscription', null, admin)).data.count === 1);
   check('a subscription row cannot be edited as an expense', (await call('PUT', `/expenses/${encodeURIComponent(sub.id)}`, base, admin)).status >= 400);
 
   const sum = await call('GET', '/expenses/summary', null, admin);
-  check('summary: spent includes manual + paid subscription, net = collected − spent', sum.status === 200 && sum.data.spent === 16090 && sum.data.net === sum.data.collected - 16090 && sum.data.months.length === 6 && sum.data.categories.some(c => c.name === 'CareBill subscription'), JSON.stringify({ spent: sum.data.spent, net: sum.data.net }));
+  check('summary: spent includes manual + paid subscription, net = collected − spent', sum.status === 200 && sum.data.spent === 16090 && sum.data.net === sum.data.collected - 16090 && sum.data.months.length === 6 && sum.data.categories.some(c => c.name === 'DhaCare subscription'), JSON.stringify({ spent: sum.data.spent, net: sum.data.net }));
   check('summary is admin only', (await call('GET', '/expenses/summary', null, rec)).status === 403);
 
   check('admin deletes an expense (soft)', (await call('DELETE', `/expenses/${recAdd.data.id}`, null, admin)).status === 200 && (await call('GET', '/expenses', null, admin)).data.items.every(i => i.id !== String(recAdd.data.id)));

@@ -40,7 +40,7 @@ const billingConfirmation = async (hospitalId, candidateId = null) => {
   const impact = await doctorImpact(pool, hospitalId, { candidateId });
   return impact.requiresConfirm ? impact : null;
 };
-const needsConfirm = (res, impact) => res.status(409).json({ code: 'BILLING_CONFIRM_REQUIRED', message: 'This change affects your CareBill charges. Please confirm.', impact });
+const needsConfirm = (res, impact) => res.status(409).json({ code: 'BILLING_CONFIRM_REQUIRED', message: 'This change affects your DhaCare charges. Please confirm.', impact });
 
 router.get('/doctor-impact', asyncHandler(async (req, res) => {
   const candidateId = req.query.candidateId ? z.coerce.number().int().positive().parse(req.query.candidateId) : null;

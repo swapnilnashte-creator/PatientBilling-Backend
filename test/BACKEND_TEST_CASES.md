@@ -1,4 +1,4 @@
-# CareBill Backend/API Test Cases
+# DhaCare Backend/API Test Cases
 
 **Scope:** Node.js/Express API, PostgreSQL persistence, authentication, role authorization, multi-hospital isolation and billing invariants.
 

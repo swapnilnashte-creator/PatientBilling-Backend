@@ -6,7 +6,7 @@ import { asyncHandler, notFound } from '../utils.js';
 import { addMonths, buildQuote, currentPeriodStart, round2, todayString } from '../billing/pricing.js';
 import { hospitalsWithDoctors, invoiceDetail, invoiceJson, invoiceSelect, loadPlans } from './superAdminBilling.js';
 
-// Hospital Admin → their CareBill subscription: current plan and the invoices the platform has issued to them.
+// Hospital Admin → their DhaCare subscription: current plan and the invoices the platform has issued to them.
 // Drafts stay private to the Super Admin until issued; internal notes are never sent.
 const router = Router();
 router.use(allow('ADMIN'));
