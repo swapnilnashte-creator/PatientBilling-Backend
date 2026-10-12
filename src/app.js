@@ -47,7 +47,11 @@ app.use(cors({
   },
 }));
 app.use(express.json({ limit: '1mb' }));
-app.use(morgan('dev'));
+if (process.env.NODE_ENV === 'production') {
+  app.use(morgan(':method :status :response-time ms'));
+} else {
+  app.use(morgan('dev'));
+}
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
@@ -65,10 +69,27 @@ app.use('/api/subscription', auth, subscriptionRoutes);
 app.use('/api/super-admin', auth, superAdminRoutes);
 
 app.use((err, _req, res, _next) => {
-  if (err?.name === 'ZodError') return res.status(400).json({ message: err.issues?.[0]?.message || 'Invalid input', details: err.issues });
-  if (err?.code === '23505') return res.status(409).json({ message: 'This record already exists' });
-  console.error(err);
-  res.status(err.status || 500).json({ message: err.message || 'Internal server error' });
-});
+  if (err?.name === 'ZodError') {
+    return res.status(400).json({
+      message: err.issues?.[0]?.message || 'Invalid input',
+      ...(process.env.NODE_ENV !== 'production'
+        ? { details: err.issues }
+        : {}),
+    });
+  }
 
+  if (err?.code === '23505') {
+    return res.status(409).json({
+      message: 'This record already exists',
+    });
+  }
+
+  console.error(err);
+
+  res.status(500).json({
+    message: process.env.NODE_ENV === 'production'
+      ? 'Internal server error'
+      : err.message || 'Internal server error',
+  });
+});
 export default app;
