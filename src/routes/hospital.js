@@ -12,9 +12,34 @@ const MAX_LOGO_SIDE = 1024;
 
 // The logo travels with the hospital row as a small data URL so it can be shown and printed without extra requests.
 const toRow = (r) => ({ id: r.id, name: r.name, mobile: r.mobile, address: r.address, logo: r.logo_data ? `data:${r.logo_mime};base64,${r.logo_data.toString('base64')}` : null, logoUpdatedAt: r.logo_updated_at, logoBytes: r.logo_data ? r.logo_data.length : 0 });
-const COLS = 'id,name,mobile,address,logo_data,logo_mime,logo_updated_at,weekly_off,timings';
+const COLS = 'id,name,mobile,address,logo_data,logo_mime,logo_updated_at,weekly_off,timings,letterhead_layout';
 
 const MAX_ON_LETTERHEAD = 6;
+
+// Layout of the printed header: where it sits, which blocks show and in what order, plus a tagline and a footer note.
+const BLOCK_KEYS = ['logo', 'name', 'tagline', 'address', 'timings', 'doctors'];
+const POSITIONS = ['left', 'right', 'top', 'minimal'];
+const COLOR_KEYS = ['name', 'tagline', 'address', 'timings', 'doctors'];
+const HEX = /^#[0-9a-fA-F]{6}$/;
+const colorsOf = (c) => Object.fromEntries(COLOR_KEYS.map(k => [k, HEX.test(c?.[k] || '') ? c[k].toLowerCase() : '']));
+const DEFAULT_LAYOUT = { position: 'left', blocks: BLOCK_KEYS.map(key => ({ key, show: true })), tagline: '', footer: '', colors: colorsOf() };
+const layoutOf = (stored) => {
+  if (!stored || typeof stored !== 'object') return DEFAULT_LAYOUT;
+  const known = Array.isArray(stored.blocks) ? stored.blocks.filter(b => BLOCK_KEYS.includes(b?.key)) : [];
+  const seen = new Set(known.map(b => b.key));
+  return {
+    position: POSITIONS.includes(stored.position) ? stored.position : 'left',
+    blocks: [...known.map(b => ({ key: b.key, show: b.show !== false })), ...BLOCK_KEYS.filter(k => !seen.has(k)).map(key => ({ key, show: true }))],
+    tagline: String(stored.tagline || ''), footer: String(stored.footer || ''), colors: colorsOf(stored.colors),
+  };
+};
+const layoutBody = z.object({
+  position: z.enum(POSITIONS),
+  blocks: z.array(z.object({ key: z.enum(BLOCK_KEYS), show: z.boolean() })).length(BLOCK_KEYS.length),
+  tagline: z.string().trim().max(80),
+  footer: z.string().trim().max(160),
+  colors: z.object(Object.fromEntries(COLOR_KEYS.map(k => [k, z.union([z.literal(''), z.string().regex(HEX)]).optional().default('')]))).optional().default(colorsOf()),
+}).refine(l => new Set(l.blocks.map(b => b.key)).size === BLOCK_KEYS.length, { message: 'Each block must be listed once' });
 const sessionsOf = (timings) => (Array.isArray(timings?.sessions) ? timings.sessions : []);
 
 // The hospital row plus everything a printed bill needs: the logo, the doctors on the letterhead (in order), timings and weekly off.
@@ -26,7 +51,7 @@ async function payload(hospitalId) {
     [hospitalId]
   );
   const row = q.rows[0];
-  return { ...toRow(row), letterhead: { doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no })), showTimings: row.timings?.show !== false, sessions: sessionsOf(row.timings), weeklyOff: row.weekly_off || [] } };
+  return { ...toRow(row), letterhead: { doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no })), showTimings: row.timings?.show !== false, sessions: sessionsOf(row.timings), weeklyOff: row.weekly_off || [], layout: layoutOf(row.letterhead_layout) } };
 }
 
 router.get('/', asyncHandler(async (req, res) => {
@@ -36,13 +61,14 @@ router.get('/', asyncHandler(async (req, res) => {
 // ---------- letterhead settings (Admin) ----------
 router.get('/letterhead', allow('ADMIN'), asyncHandler(async (req, res) => {
   const [h, docs] = await Promise.all([
-    pool.query(`SELECT weekly_off,timings FROM hospitals WHERE id=$1`, [req.user.hospitalId]),
+    pool.query(`SELECT weekly_off,timings,letterhead_layout FROM hospitals WHERE id=$1`, [req.user.hospitalId]),
     pool.query(`SELECT id,name,qualification,registration_no,on_letterhead,letterhead_order FROM users WHERE hospital_id=$1 AND role='DOCTOR' AND is_active=TRUE AND deleted_at IS NULL ORDER BY on_letterhead DESC,letterhead_order NULLS LAST,name`, [req.user.hospitalId]),
   ]);
   res.json({
     max: MAX_ON_LETTERHEAD,
     doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no, show: d.on_letterhead })),
     showTimings: h.rows[0].timings?.show !== false, sessions: sessionsOf(h.rows[0].timings), weeklyOff: h.rows[0].weekly_off || [],
+    layout: layoutOf(h.rows[0].letterhead_layout),
   });
 }));
 
@@ -52,6 +78,7 @@ const letterheadBody = z.object({
   showTimings: z.boolean(),
   sessions: z.array(z.object({ from: z.string().regex(TIME), to: z.string().regex(TIME) })).max(2),
   weeklyOff: z.array(z.number().int().min(0).max(6)).max(7),
+  layout: layoutBody.optional(),
 });
 router.put('/letterhead', allow('ADMIN'), asyncHandler(async (req, res) => {
   const body = letterheadBody.parse(req.body);
@@ -69,6 +96,7 @@ router.put('/letterhead', allow('ADMIN'), asyncHandler(async (req, res) => {
     if (ok.rowCount !== body.doctors.length) throw badRequest('One of the doctors was not found');
     for (const [i, d] of body.doctors.entries()) await client.query(`UPDATE users SET on_letterhead=$1,letterhead_order=$2 WHERE id=$3 AND hospital_id=$4`, [d.show, i + 1, d.id, req.user.hospitalId]);
     await client.query(`UPDATE hospitals SET weekly_off=$1::smallint[],timings=$2::jsonb,updated_at=NOW() WHERE id=$3`, [weeklyOff, JSON.stringify({ show: body.showTimings, sessions: body.sessions }), req.user.hospitalId]);
+    if (body.layout) await client.query(`UPDATE hospitals SET letterhead_layout=$1::jsonb WHERE id=$2`, [JSON.stringify(body.layout), req.user.hospitalId]);
   });
   res.json(await payload(req.user.hospitalId));
 }));
