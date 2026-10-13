@@ -136,9 +136,28 @@ router.get('/doctors', asyncHandler(async (req, res) => {
   res.json(q.rows);
 }));
 
+// Vitals taken for a visit. Every reading is optional; an empty value clears it.
+const vital = (min, max, whole = false) => z.preprocess(
+  v => (v === '' || v === undefined ? null : v),
+  z.union([z.null(), (whole ? z.coerce.number().int() : z.coerce.number()).min(min).max(max)]),
+);
+export const vitalsSchema = z.object({
+  weightKg: vital(1, 500),
+  heightCm: vital(30, 260),
+  heartRate: vital(20, 300, true),
+  spo2: vital(30, 100, true),
+  temperature: vital(30, 115),
+  temperatureUnit: z.enum(['C', 'F']).optional().default('F'),
+}).refine(v => v.temperature === null || (v.temperatureUnit === 'C' ? v.temperature >= 30 && v.temperature <= 45 : v.temperature >= 86 && v.temperature <= 113),
+  { message: 'Temperature looks wrong for the chosen unit', path: ['temperature'] });
+const VITALS_COLUMNS = 'weight_kg,height_cm,heart_rate,spo2,temperature,temperature_unit,vitals_updated_at';
+const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.temperatureUnit];
+const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature].some(x => x !== null && x !== undefined);
+
 router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = z.object({
     patientId: z.coerce.number().int().positive(),
+    vitals: vitalsSchema.optional(),
     doctorIds: doctorIdsSchema.optional(),
     doctorId: z.coerce.number().int().positive().optional(),
   }).parse(req.body);
@@ -175,6 +194,13 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
          VALUES($1,$2,$3,$4)`,
         [req.user.hospitalId, q.rows[0].id, doctorIds[index], index + 1]
       );
+    }
+    if (data.vitals && anyVital(data.vitals)) {
+      const v = await client.query(
+        `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,vitals_updated_at=NOW() WHERE id=$1 AND hospital_id=$2 RETURNING *`,
+        [q.rows[0].id, req.user.hospitalId, ...vitalsParams(data.vitals)]
+      );
+      return v.rows[0];
     }
     return q.rows[0];
   });
@@ -357,6 +383,23 @@ router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
       `UPDATE visit_doctors SET status='IN_PROGRESS',started_at=COALESCE(started_at,NOW()),updated_at=NOW()
        WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3 AND status='WAITING'`,
       [req.user.hospitalId, req.params.id, q.rows[0].doctor_id]
+    );
+    return q.rows[0];
+  });
+  res.json(result);
+}));
+
+// Weight, height, heart rate, SpO2 and temperature for this visit: taken at the desk or by the doctor, editable until the visit is paid.
+router.put('/:id/vitals', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
+  const data = vitalsSchema.parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
+    if (!['WAITING_FOR_DOCTOR', 'WITH_DOCTOR', 'PAYMENT_PENDING'].includes(visit.status)) throw badRequest('Vitals can be changed only while the visit is open');
+    if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+    const q = await client.query(
+      `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,vitals_updated_at=NOW(),updated_at=NOW()
+       WHERE id=$1 AND hospital_id=$2 RETURNING ${VITALS_COLUMNS}`,
+      [req.params.id, req.user.hospitalId, ...vitalsParams(data)]
     );
     return q.rows[0];
   });
