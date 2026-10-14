@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../db.js';
-import { asyncHandler, notFound } from '../utils.js';
+import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { allow } from '../middleware/auth.js';
 import { mobileSchema } from '../mobile.js';
 
@@ -63,8 +63,19 @@ router.get('/by-code/:code', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandle
   res.json(row);
 }));
 
+// The same person is never registered twice: same mobile and same name (any capitals) in this hospital.
+// Family members sharing a phone are fine because their names differ.
+async function assertNotDuplicate(hospitalId, mobile, fullName, exceptId = null) {
+  const q = await pool.query(
+    `SELECT id FROM patients WHERE hospital_id=$1 AND mobile=$2 AND lower(trim(full_name))=lower(trim($3)) AND deleted_at IS NULL AND ($4::bigint IS NULL OR id<>$4) LIMIT 1`,
+    [hospitalId, mobile, fullName, exceptId]
+  );
+  if (q.rowCount) throw badRequest(`${fullName.trim()} is already registered with this mobile number. Select the existing patient instead of adding a new one.`);
+}
+
 router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = patientSchema.parse(req.body);
+  await assertNotDuplicate(req.user.hospitalId, data.mobile, data.fullName);
   const q = await pool.query(
     `INSERT INTO patients(hospital_id,full_name,mobile,gender,date_of_birth,dob_estimated,address,created_by,updated_by)
      VALUES($1,$2,$3,$4,${dobSql(5, 6)},$5::date IS NULL,$7,$8,$8)
@@ -76,6 +87,7 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
 
 router.put('/:id', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = patientSchema.parse(req.body);
+  await assertNotDuplicate(req.user.hospitalId, data.mobile, data.fullName, req.params.id);
   const q = await pool.query(
     `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=${dobSql(4, 5)},dob_estimated=$4::date IS NULL,address=$6,updated_by=$7,updated_at=NOW()
      WHERE id=$8 AND hospital_id=$9 AND deleted_at IS NULL

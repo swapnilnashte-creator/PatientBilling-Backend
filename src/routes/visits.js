@@ -91,7 +91,7 @@ async function getCorrections(client, hospitalId, visitId) {
 async function getVisitDoctors(client, hospitalId, visitId) {
   const q = await client.query(
     `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,u.qualification AS doctor_qualification,u.registration_no AS doctor_registration_no,vd.position,vd.status,
-            vd.doctor_notes,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
+            vd.doctor_notes,vd.advice,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
      FROM visit_doctors vd
      JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
      WHERE vd.hospital_id=$1 AND vd.visit_id=$2
@@ -418,7 +418,7 @@ router.put('/:id/vitals', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
 }));
 
 router.put('/:id/doctor-notes', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
-  const data = z.object({ notes: z.string().max(5000) }).parse(req.body);
+  const data = z.object({ notes: z.string().max(5000), advice: z.string().max(1000).optional() }).parse(req.body);
   const result = await withTransaction(async (client) => {
     const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
     if (visit.status !== 'WITH_DOCTOR') throw badRequest('Findings can be edited only while the patient is with the doctor');
@@ -431,9 +431,9 @@ router.put('/:id/doctor-notes', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHan
       [data.notes, req.user.id, req.params.id, req.user.hospitalId]
     );
     await client.query(
-      `UPDATE visit_doctors SET doctor_notes=NULLIF(trim($1),''),updated_at=NOW()
+      `UPDATE visit_doctors SET doctor_notes=NULLIF(trim($1),''),advice=CASE WHEN $5::text IS NULL THEN advice ELSE NULLIF(trim($5),'') END,updated_at=NOW()
        WHERE hospital_id=$2 AND visit_id=$3 AND doctor_id=$4 AND status='IN_PROGRESS'`,
-      [data.notes, req.user.hospitalId, req.params.id, visit.doctor_id]
+      [data.notes, req.user.hospitalId, req.params.id, visit.doctor_id, data.advice ?? null]
     );
     return q.rows[0];
   });
