@@ -5,7 +5,9 @@ import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest } from '../utils.js';
 
 const router = Router();
-router.use(allow('ADMIN','RECEPTIONIST'));
+// Doctors may open only their own per-doctor report; everything else stays Admin and Reception.
+const staff = allow('ADMIN','RECEPTIONIST');
+router.use(allow('ADMIN','RECEPTIONIST','DOCTOR'));
 
 router.get('/doctors/:doctorId/visits', asyncHandler(async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
@@ -14,6 +16,7 @@ router.get('/doctors/:doctorId/visits', asyncHandler(async (req, res) => {
   const dateTo = allTime ? null : z.string().date().parse(String(req.query.dateTo || today));
   const doctorId = z.coerce.number().int().positive().parse(req.params.doctorId);
   if (dateFrom && dateTo && dateFrom > dateTo) throw badRequest('From date cannot be after To date');
+  if (req.user.role === 'DOCTOR' && doctorId !== Number(req.user.id)) return res.status(403).json({ message: 'You can only see your own report' });
 
   const doctorQ = await pool.query(
     `SELECT id,name FROM users
@@ -23,7 +26,7 @@ router.get('/doctors/:doctorId/visits', asyncHandler(async (req, res) => {
   if (!doctorQ.rowCount) throw badRequest('Doctor not found');
 
   const q = await pool.query(
-    `SELECT v.id,v.visit_number,p.full_name,p.mobile,vd.completed_at AS consultation_date,
+    `SELECT v.id,v.visit_number,v.daily_number,p.id AS patient_id,p.full_name,p.mobile,vd.completed_at AS consultation_date,
             CASE
               WHEN pay.id IS NOT NULL THEN 'PAID'
               WHEN v.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT') THEN 'UNPAID'
@@ -38,14 +41,14 @@ router.get('/doctors/:doctorId/visits', asyncHandler(async (req, res) => {
      WHERE vd.hospital_id=$1 AND vd.doctor_id=$2 AND vd.status='COMPLETED'
        AND ($3::date IS NULL OR vd.completed_at >= $3::date)
        AND ($4::date IS NULL OR vd.completed_at < $4::date + INTERVAL '1 day')
-     GROUP BY v.id,v.visit_number,p.id,p.full_name,p.mobile,vd.completed_at,pay.id
+     GROUP BY v.id,v.visit_number,v.daily_number,p.id,p.full_name,p.mobile,vd.completed_at,pay.id
      ORDER BY vd.completed_at DESC,v.id DESC`,
     [req.user.hospitalId, doctorId, dateFrom, dateTo]
   );
   res.json({ doctor: doctorQ.rows[0], visits: q.rows, range: { dateFrom, dateTo, allTime } });
 }));
 
-router.get('/', asyncHandler(async (req, res) => {
+router.get('/', staff, asyncHandler(async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const allTime = String(req.query.allTime || '') === '1';
   const dateFrom = allTime ? null : z.string().date().parse(String(req.query.dateFrom || today));

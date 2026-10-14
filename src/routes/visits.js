@@ -265,7 +265,7 @@ router.get('/', asyncHandler(async (req, res) => {
   const params = [req.user.hospitalId];
   let where = 'v.hospital_id=$1';
   if (req.user.role === 'DOCTOR') {
-    params.push(req.user.id); where += ` AND v.doctor_id=$${params.length}`;
+    params.push(req.user.id); where += ` AND (v.doctor_id=$${params.length} OR (EXISTS(SELECT 1 FROM visit_doctors vd WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id AND vd.doctor_id=$${params.length} AND vd.status='COMPLETED')))`;
   }
   if (status) {
     params.push(status); where += ` AND v.status=$${params.length}`;
@@ -305,7 +305,11 @@ router.get('/', asyncHandler(async (req, res) => {
 router.get('/:id', asyncHandler(async (req, res) => {
   const client = pool;
   const visit = await getVisit(client, req.user.hospitalId, req.params.id);
-  if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+  if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) {
+    // a visit stays open to every doctor who has completed their consultation in it (to review details or issue a certificate)
+    const took = (await client.query(`SELECT 1 FROM visit_doctors WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3 AND status='COMPLETED'`, [req.user.hospitalId, req.params.id, req.user.id])).rowCount;
+    if (!took) throw forbidden('This visit is assigned to another doctor');
+  }
   const charges = await getCharges(client, req.user.hospitalId, req.params.id);
   const payment = await client.query(
     `SELECT p.id,p.amount,p.payment_mode,p.reference_no,p.accepted_by,p.paid_at,u.name AS accepted_by_name

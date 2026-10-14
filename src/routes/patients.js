@@ -107,7 +107,8 @@ router.get('/:id/history', asyncHandler(async (req, res) => {
   if (!patient.rowCount) throw notFound('Patient not found');
 
   const visits = await pool.query(
-    `SELECT v.id,v.visit_number,v.status,v.created_at,v.completed_at,
+    `SELECT v.id,v.visit_number,v.daily_number,v.status,v.created_at,v.completed_at,
+            COALESCE((SELECT json_agg(json_build_object('name',pi.name,'dose',pi.dose,'days',pi.duration_days) ORDER BY pi.doctor_id,pi.position) FROM visit_prescription_items pi WHERE pi.hospital_id=v.hospital_id AND pi.visit_id=v.id),'[]'::json) AS medicines,
             COALESCE((SELECT string_agg(CASE WHEN vd.doctor_notes IS NOT NULL THEN du.name || ': ' || vd.doctor_notes END,E'\n\n' ORDER BY vd.position)
                       FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
                       WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id),v.doctor_notes) AS doctor_notes,
