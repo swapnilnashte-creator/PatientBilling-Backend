@@ -87,7 +87,7 @@ router.get('/', staff, asyncHandler(async (req, res) => {
       params
     ),
     pool.query(
-      `SELECT p.paid_at::date AS date,COUNT(*)::int AS payments,
+      `SELECT to_char(p.paid_at::date,'YYYY-MM-DD') AS date,COUNT(*)::int AS payments,
               COALESCE(SUM(p.amount),0)::numeric(14,2) AS total,
               COALESCE(SUM(p.amount) FILTER (WHERE p.payment_mode='CASH'),0)::numeric(14,2) AS cash,
               COALESCE(SUM(p.amount) FILTER (WHERE p.payment_mode='UPI'),0)::numeric(14,2) AS upi,
