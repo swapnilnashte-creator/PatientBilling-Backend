@@ -183,10 +183,19 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
        RETURNING next_number-1 AS visit_number`,
       [req.user.hospitalId]
     );
+    // the daily token restarts at 1 each day (India time) for this hospital
+    const dailyQ = await client.query(
+      `INSERT INTO hospital_daily_visit_counters(hospital_id,day,next_number)
+       VALUES($1,(NOW() AT TIME ZONE 'Asia/Kolkata')::date,2)
+       ON CONFLICT (hospital_id,day) DO UPDATE
+       SET next_number=hospital_daily_visit_counters.next_number+1
+       RETURNING next_number-1 AS daily_number`,
+      [req.user.hospitalId]
+    );
     const q = await client.query(
-      `INSERT INTO visits(hospital_id,visit_number,patient_id,doctor_id,created_by)
-       VALUES($1,$2,$3,$4,$5) RETURNING *`,
-      [req.user.hospitalId, numberQ.rows[0].visit_number, data.patientId, doctorIds[0], req.user.id]
+      `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.user.hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, data.patientId, doctorIds[0], req.user.id]
     );
     for (let index = 0; index < doctorIds.length; index += 1) {
       await client.query(
@@ -266,7 +275,7 @@ router.get('/', asyncHandler(async (req, res) => {
     params.push(dateTo); where += ` AND v.created_at < ($${params.length}::date + INTERVAL '1 day')`;
   }
   const q = await pool.query(
-    `SELECT v.id,v.visit_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
+    `SELECT v.id,v.visit_number,v.daily_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
             p.id AS patient_id,p.full_name,p.mobile,d.name AS doctor_name,
             (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status,'started_at',vd.started_at,'completed_at',vd.completed_at) ORDER BY vd.position)
              FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
