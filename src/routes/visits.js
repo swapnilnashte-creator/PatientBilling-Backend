@@ -91,7 +91,7 @@ async function getCorrections(client, hospitalId, visitId) {
 async function getVisitDoctors(client, hospitalId, visitId) {
   const q = await client.query(
     `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,u.qualification AS doctor_qualification,u.registration_no AS doctor_registration_no,vd.position,vd.status,
-            vd.doctor_notes,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
+            vd.doctor_notes,vd.advice,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
      FROM visit_doctors vd
      JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
      WHERE vd.hospital_id=$1 AND vd.visit_id=$2
@@ -136,9 +136,28 @@ router.get('/doctors', asyncHandler(async (req, res) => {
   res.json(q.rows);
 }));
 
+// Vitals taken for a visit. Every reading is optional; an empty value clears it.
+const vital = (min, max, whole = false) => z.preprocess(
+  v => (v === '' || v === undefined ? null : v),
+  z.union([z.null(), (whole ? z.coerce.number().int() : z.coerce.number()).min(min).max(max)]),
+);
+export const vitalsSchema = z.object({
+  weightKg: vital(1, 500),
+  heightCm: vital(30, 260),
+  heartRate: vital(20, 300, true),
+  spo2: vital(30, 100, true),
+  temperature: vital(30, 115),
+  temperatureUnit: z.enum(['C', 'F']).optional().default('F'),
+}).refine(v => v.temperature === null || (v.temperatureUnit === 'C' ? v.temperature >= 30 && v.temperature <= 45 : v.temperature >= 86 && v.temperature <= 113),
+  { message: 'Temperature looks wrong for the chosen unit', path: ['temperature'] });
+const VITALS_COLUMNS = 'weight_kg,height_cm,heart_rate,spo2,temperature,temperature_unit,vitals_updated_at';
+const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.temperatureUnit];
+const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature].some(x => x !== null && x !== undefined);
+
 router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = z.object({
     patientId: z.coerce.number().int().positive(),
+    vitals: vitalsSchema.optional(),
     doctorIds: doctorIdsSchema.optional(),
     doctorId: z.coerce.number().int().positive().optional(),
   }).parse(req.body);
@@ -149,11 +168,13 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
   const check = await pool.query(
     `SELECT
        EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL) AS patient_ok,
-       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND date_of_birth IS NOT NULL) AS has_age`,
+       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND date_of_birth IS NOT NULL) AS has_age,
+       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND gender IS NOT NULL) AS has_gender`,
     [data.patientId, req.user.hospitalId]
   );
   if (!check.rows[0].patient_ok) throw badRequest('Invalid patient');
   if (!check.rows[0].has_age) throw badRequest('Age or date of birth is required to register a visit');
+  if (!check.rows[0].has_gender) throw badRequest('Gender is required to register a visit');
   const visit = await withTransaction(async (client) => {
     await validateDoctors(client, req.user.hospitalId, doctorIds);
     const numberQ = await client.query(
@@ -164,10 +185,19 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
        RETURNING next_number-1 AS visit_number`,
       [req.user.hospitalId]
     );
+    // the daily token restarts at 1 each day (India time) for this hospital
+    const dailyQ = await client.query(
+      `INSERT INTO hospital_daily_visit_counters(hospital_id,day,next_number)
+       VALUES($1,(NOW() AT TIME ZONE 'Asia/Kolkata')::date,2)
+       ON CONFLICT (hospital_id,day) DO UPDATE
+       SET next_number=hospital_daily_visit_counters.next_number+1
+       RETURNING next_number-1 AS daily_number`,
+      [req.user.hospitalId]
+    );
     const q = await client.query(
-      `INSERT INTO visits(hospital_id,visit_number,patient_id,doctor_id,created_by)
-       VALUES($1,$2,$3,$4,$5) RETURNING *`,
-      [req.user.hospitalId, numberQ.rows[0].visit_number, data.patientId, doctorIds[0], req.user.id]
+      `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by)
+       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [req.user.hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, data.patientId, doctorIds[0], req.user.id]
     );
     for (let index = 0; index < doctorIds.length; index += 1) {
       await client.query(
@@ -175,6 +205,13 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
          VALUES($1,$2,$3,$4)`,
         [req.user.hospitalId, q.rows[0].id, doctorIds[index], index + 1]
       );
+    }
+    if (data.vitals && anyVital(data.vitals)) {
+      const v = await client.query(
+        `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,vitals_updated_at=NOW() WHERE id=$1 AND hospital_id=$2 RETURNING *`,
+        [q.rows[0].id, req.user.hospitalId, ...vitalsParams(data.vitals)]
+      );
+      return v.rows[0];
     }
     return q.rows[0];
   });
@@ -228,7 +265,7 @@ router.get('/', asyncHandler(async (req, res) => {
   const params = [req.user.hospitalId];
   let where = 'v.hospital_id=$1';
   if (req.user.role === 'DOCTOR') {
-    params.push(req.user.id); where += ` AND v.doctor_id=$${params.length}`;
+    params.push(req.user.id); where += ` AND (v.doctor_id=$${params.length} OR (EXISTS(SELECT 1 FROM visit_doctors vd WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id AND vd.doctor_id=$${params.length} AND vd.status='COMPLETED')))`;
   }
   if (status) {
     params.push(status); where += ` AND v.status=$${params.length}`;
@@ -240,7 +277,7 @@ router.get('/', asyncHandler(async (req, res) => {
     params.push(dateTo); where += ` AND v.created_at < ($${params.length}::date + INTERVAL '1 day')`;
   }
   const q = await pool.query(
-    `SELECT v.id,v.visit_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
+    `SELECT v.id,v.visit_number,v.daily_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
             p.id AS patient_id,p.full_name,p.mobile,d.name AS doctor_name,
             (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status,'started_at',vd.started_at,'completed_at',vd.completed_at) ORDER BY vd.position)
              FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
@@ -268,7 +305,11 @@ router.get('/', asyncHandler(async (req, res) => {
 router.get('/:id', asyncHandler(async (req, res) => {
   const client = pool;
   const visit = await getVisit(client, req.user.hospitalId, req.params.id);
-  if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+  if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) {
+    // a visit stays open to every doctor who has completed their consultation in it (to review details or issue a certificate)
+    const took = (await client.query(`SELECT 1 FROM visit_doctors WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3 AND status='COMPLETED'`, [req.user.hospitalId, req.params.id, req.user.id])).rowCount;
+    if (!took) throw forbidden('This visit is assigned to another doctor');
+  }
   const charges = await getCharges(client, req.user.hospitalId, req.params.id);
   const payment = await client.query(
     `SELECT p.id,p.amount,p.payment_mode,p.reference_no,p.accepted_by,p.paid_at,u.name AS accepted_by_name
@@ -363,8 +404,25 @@ router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
   res.json(result);
 }));
 
+// Weight, height, heart rate, SpO2 and temperature for this visit: taken at the desk or by the doctor, editable until the visit is paid.
+router.put('/:id/vitals', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
+  const data = vitalsSchema.parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
+    if (!['WAITING_FOR_DOCTOR', 'WITH_DOCTOR', 'PAYMENT_PENDING'].includes(visit.status)) throw badRequest('Vitals can be changed only while the visit is open');
+    if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+    const q = await client.query(
+      `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,vitals_updated_at=NOW(),updated_at=NOW()
+       WHERE id=$1 AND hospital_id=$2 RETURNING ${VITALS_COLUMNS}`,
+      [req.params.id, req.user.hospitalId, ...vitalsParams(data)]
+    );
+    return q.rows[0];
+  });
+  res.json(result);
+}));
+
 router.put('/:id/doctor-notes', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
-  const data = z.object({ notes: z.string().max(5000) }).parse(req.body);
+  const data = z.object({ notes: z.string().max(5000), advice: z.string().max(1000).optional() }).parse(req.body);
   const result = await withTransaction(async (client) => {
     const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
     if (visit.status !== 'WITH_DOCTOR') throw badRequest('Findings can be edited only while the patient is with the doctor');
@@ -377,9 +435,9 @@ router.put('/:id/doctor-notes', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHan
       [data.notes, req.user.id, req.params.id, req.user.hospitalId]
     );
     await client.query(
-      `UPDATE visit_doctors SET doctor_notes=NULLIF(trim($1),''),updated_at=NOW()
+      `UPDATE visit_doctors SET doctor_notes=NULLIF(trim($1),''),advice=CASE WHEN $5::text IS NULL THEN advice ELSE NULLIF(trim($5),'') END,updated_at=NOW()
        WHERE hospital_id=$2 AND visit_id=$3 AND doctor_id=$4 AND status='IN_PROGRESS'`,
-      [data.notes, req.user.hospitalId, req.params.id, visit.doctor_id]
+      [data.notes, req.user.hospitalId, req.params.id, visit.doctor_id, data.advice ?? null]
     );
     return q.rows[0];
   });

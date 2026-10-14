@@ -14,6 +14,8 @@ import accountRoutes from './routes/account.js';
 import reportRoutes from './routes/reports.js';
 import medicineRoutes from './routes/medicines.js';
 import expenseRoutes from './routes/expenses.js';
+import certificateRoutes from './routes/certificates.js';
+import findingTemplateRoutes from './routes/findingTemplates.js';
 import subscriptionRoutes from './routes/subscription.js';
 import superAdminRoutes from './routes/superAdmin.js';
 import { auth } from './middleware/auth.js';
@@ -65,6 +67,8 @@ app.use('/api/account', auth, accountRoutes);
 app.use('/api/reports', auth, reportRoutes);
 app.use('/api/medicines', auth, medicineRoutes);
 app.use('/api/expenses', auth, expenseRoutes);
+app.use('/api/certificates', auth, certificateRoutes);
+app.use('/api/finding-templates', auth, findingTemplateRoutes);
 app.use('/api/subscription', auth, subscriptionRoutes);
 app.use('/api/super-admin', auth, superAdminRoutes);
 
