@@ -19,6 +19,13 @@ const registerSchema = z.object({
   password: z.string().min(6).max(100),
 });
 
+// Who to contact for help, as set by the platform Super Admin (Payment setup). Public, so the login page can show it.
+router.get('/support', asyncHandler(async (_req, res) => {
+  const q = await pool.query(`SELECT name,support_phone,support_email FROM platform_billing_company WHERE id=1`);
+  const r = q.rows[0] || {};
+  res.json({ name: r.name || 'DhaCare', phone: r.support_phone || '', email: r.support_email || '' });
+}));
+
 router.post('/register-hospital', asyncHandler(async (req, res) => {
   const data = registerSchema.parse(req.body);
   const reservedMobile = await pool.query(`SELECT id FROM platform_superusers WHERE mobile=$1`, [data.adminMobile]);

@@ -168,11 +168,13 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
   const check = await pool.query(
     `SELECT
        EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL) AS patient_ok,
-       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND date_of_birth IS NOT NULL) AS has_age`,
+       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND date_of_birth IS NOT NULL) AS has_age,
+       EXISTS(SELECT 1 FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL AND gender IS NOT NULL) AS has_gender`,
     [data.patientId, req.user.hospitalId]
   );
   if (!check.rows[0].patient_ok) throw badRequest('Invalid patient');
   if (!check.rows[0].has_age) throw badRequest('Age or date of birth is required to register a visit');
+  if (!check.rows[0].has_gender) throw badRequest('Gender is required to register a visit');
   const visit = await withTransaction(async (client) => {
     await validateDoctors(client, req.user.hospitalId, doctorIds);
     const numberQ = await client.query(
