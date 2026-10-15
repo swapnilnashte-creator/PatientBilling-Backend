@@ -66,7 +66,28 @@ router.get('/', asyncHandler(async (req, res) => {
     );
     completed = completedQ.rows[0].completed;
   }
-  res.json({ ...q.rows[0], completed, revenue: revenue.rows[0].revenue, todayRevenue: revenue.rows[0].revenue });
+  const result = { ...q.rows[0], completed, revenue: revenue.rows[0].revenue, todayRevenue: revenue.rows[0].revenue };
+  // Admin only: what was spent in the same period (recorded expenses plus DhaCare subscription invoices once paid, as on the
+  // Expenses page) and what is left after those costs
+  if (req.user.role === 'ADMIN') {
+    const from = allTime ? null : (dateFrom || (dateTo ? null : 'today'));
+    const to = allTime ? null : (dateTo || (dateFrom ? null : 'today'));
+    const range = (column) => {
+      const p = []; let w = '';
+      if (from === 'today') w += ` AND ${column}=CURRENT_DATE`;
+      else if (from) { p.push(from); w += ` AND ${column}>=$${p.length + 1}::date`; }
+      if (to && to !== 'today') { p.push(to); w += ` AND ${column}<=$${p.length + 1}::date`; }
+      return { p, w };
+    };
+    const e = range('expense_date'); const i = range('paid_on');
+    const [spent, subs] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(amount),0)::numeric(14,2) AS v FROM expenses WHERE hospital_id=$1 AND deleted_at IS NULL${e.w}`, [req.user.hospitalId, ...e.p]),
+      pool.query(`SELECT COALESCE(SUM(COALESCE(paid_amount,total)),0)::numeric(14,2) AS v FROM platform_invoices WHERE hospital_id=$1 AND status='PAID' AND paid_on IS NOT NULL${i.w}`, [req.user.hospitalId, ...i.p]),
+    ]);
+    result.expenses = Math.round((Number(spent.rows[0].v) + Number(subs.rows[0].v)) * 100) / 100;
+    result.net = Math.round((Number(revenue.rows[0].revenue) - result.expenses) * 100) / 100;
+  }
+  res.json(result);
 }));
 
 export default router;

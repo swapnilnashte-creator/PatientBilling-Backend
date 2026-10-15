@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import 'dotenv/config';
+import { logError } from './errorLog.js';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import patientRoutes from './routes/patients.js';
@@ -68,11 +69,16 @@ app.use('/api/finding-templates', auth, findingTemplateRoutes);
 app.use('/api/subscription', auth, subscriptionRoutes);
 app.use('/api/super-admin', auth, superAdminRoutes);
 
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   if (err?.name === 'ZodError') return res.status(400).json({ message: err.issues?.[0]?.message || 'Invalid input', details: err.issues });
   if (err?.code === '23505') return res.status(409).json({ message: 'This record already exists' });
+  const status = err.status || 500;
+  // expected problems (wrong password, not found, not allowed) carry their own message; anything unexpected is written to the
+  // daily error log and the person sees a short reference to quote instead of internal details
+  if (status < 500) return res.status(status).json({ message: err.message || 'Request failed' });
   console.error(err);
-  res.status(err.status || 500).json({ message: err.message || 'Internal server error' });
+  const ref = logError(err, { method: req.method, url: req.originalUrl, status, user: req.user ? `${req.user.role} ${req.user.id}${req.user.hospitalId ? ` (hospital ${req.user.hospitalId})` : ''}` : '' });
+  res.status(status).json({ message: `Something went wrong on our side. Please try again. If it keeps happening, tell support this reference: ${ref}`, ref });
 });
 
 export default app;

@@ -29,7 +29,8 @@ router.get('/doctors/:doctorId/visits', asyncHandler(async (req, res) => {
     `SELECT v.id,v.visit_number,v.daily_number,p.id AS patient_id,p.full_name,p.mobile,vd.completed_at AS consultation_date,
             CASE
               WHEN pay.id IS NOT NULL THEN 'PAID'
-              WHEN v.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT') THEN 'UNPAID'
+              WHEN v.status='LEFT_WITHOUT_PAYMENT' THEN 'LEFT_UNPAID'
+              WHEN v.status='PAYMENT_PENDING' THEN 'UNPAID'
               ELSE 'NOT_FINALIZED'
             END AS payment_status,
             COALESCE(SUM(vc.amount),0)::numeric(14,2) AS amount
