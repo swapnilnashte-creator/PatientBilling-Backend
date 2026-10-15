@@ -1,3 +1,4 @@
+﻿import { logError } from './errorLog.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -72,7 +73,7 @@ app.use('/api/finding-templates', auth, findingTemplateRoutes);
 app.use('/api/subscription', auth, subscriptionRoutes);
 app.use('/api/super-admin', auth, superAdminRoutes);
 
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   if (err?.name === 'ZodError') {
     return res.status(400).json({
       message: err.issues?.[0]?.message || 'Invalid input',
@@ -88,12 +89,35 @@ app.use((err, _req, res, _next) => {
     });
   }
 
+  const status = Number.isInteger(err?.status) &&
+    err.status >= 400 &&
+    err.status <= 599
+      ? err.status
+      : 500;
+
+  if (status < 500) {
+    return res.status(status).json({
+      message: err.message || 'Request failed',
+    });
+  }
+
   console.error(err);
 
-  res.status(500).json({
-    message: process.env.NODE_ENV === 'production'
-      ? 'Internal server error'
-      : err.message || 'Internal server error',
+  const ref = logError(err, {
+    method: req.method,
+    url: req.originalUrl,
+    status,
+    user: req.user
+      ? `${req.user.role} ${req.user.id}${req.user.hospitalId
+          ? ` (hospital ${req.user.hospitalId})`
+          : ''}`
+      : '',
+  });
+
+  return res.status(status).json({
+    message: `Something went wrong on our side. Please try again. If it keeps happening, tell support this reference: ${ref}`,
+    ref,
   });
 });
+
 export default app;

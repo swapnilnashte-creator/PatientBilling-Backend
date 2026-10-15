@@ -1,5 +1,6 @@
 import pg from 'pg';
 import 'dotenv/config';
+import { logError } from './errorLog.js';
 
 const { Pool } = pg;
 
@@ -12,7 +13,7 @@ export const pool = new Pool({
   idleTimeoutMillis: 30000,});
 
 // A database connection that drops while idle must not crash the server (the next request just opens a new one)
-pool.on('error', (error) => console.error('Idle database connection error:', error.message));
+pool.on('error', (error) => { console.error('Idle database connection error:', error.message); logError(error, { source: 'idle database connection' }); });
 
 export async function withTransaction(fn) {
   const client = await pool.connect();

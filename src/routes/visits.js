@@ -91,7 +91,7 @@ async function getCorrections(client, hospitalId, visitId) {
 async function getVisitDoctors(client, hospitalId, visitId) {
   const q = await client.query(
     `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,u.qualification AS doctor_qualification,u.registration_no AS doctor_registration_no,vd.position,vd.status,
-            vd.doctor_notes,vd.advice,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
+            vd.doctor_notes,vd.advice,vd.follow_up_days,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
      FROM visit_doctors vd
      JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
      WHERE vd.hospital_id=$1 AND vd.visit_id=$2
@@ -146,13 +146,17 @@ export const vitalsSchema = z.object({
   heightCm: vital(30, 260),
   heartRate: vital(20, 300, true),
   spo2: vital(30, 100, true),
+  bpSystolic: vital(50, 300, true),
+  bpDiastolic: vital(30, 200, true),
   temperature: vital(30, 115),
   temperatureUnit: z.enum(['C', 'F']).optional().default('F'),
 }).refine(v => v.temperature === null || (v.temperatureUnit === 'C' ? v.temperature >= 30 && v.temperature <= 45 : v.temperature >= 86 && v.temperature <= 113),
-  { message: 'Temperature looks wrong for the chosen unit', path: ['temperature'] });
-const VITALS_COLUMNS = 'weight_kg,height_cm,heart_rate,spo2,temperature,temperature_unit,vitals_updated_at';
-const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.temperatureUnit];
-const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature].some(x => x !== null && x !== undefined);
+  { message: 'Temperature looks wrong for the chosen unit', path: ['temperature'] })
+  .refine(v => (v.bpSystolic === null) === (v.bpDiastolic === null), { message: 'Enter both numbers of the blood pressure (for example 120 and 80)', path: ['bpSystolic'] })
+  .refine(v => v.bpSystolic === null || v.bpSystolic > v.bpDiastolic, { message: 'The upper blood pressure number must be higher than the lower one', path: ['bpSystolic'] });
+const VITALS_COLUMNS = 'weight_kg,height_cm,heart_rate,spo2,temperature,temperature_unit,bp_systolic,bp_diastolic,vitals_updated_at';
+const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.temperatureUnit, v.bpSystolic, v.bpDiastolic];
+const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.bpSystolic].some(x => x !== null && x !== undefined);
 
 router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const data = z.object({
@@ -208,7 +212,7 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
     }
     if (data.vitals && anyVital(data.vitals)) {
       const v = await client.query(
-        `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,vitals_updated_at=NOW() WHERE id=$1 AND hospital_id=$2 RETURNING *`,
+        `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,bp_systolic=$9,bp_diastolic=$10,vitals_updated_at=NOW() WHERE id=$1 AND hospital_id=$2 RETURNING *`,
         [q.rows[0].id, req.user.hospitalId, ...vitalsParams(data.vitals)]
       );
       return v.rows[0];
@@ -386,6 +390,16 @@ router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req
 
 router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const result = await withTransaction(async (client) => {
+    // one consultation at a time: the doctor must finish (or send on) the visit they have open before starting the next
+    const target = await client.query(`SELECT doctor_id FROM visits WHERE id=$1 AND hospital_id=$2 AND status='WAITING_FOR_DOCTOR'`, [req.params.id, req.user.hospitalId]);
+    if (target.rowCount) {
+      const open = await client.query(
+        `SELECT v.id,p.full_name FROM visits v JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
+         WHERE v.hospital_id=$1 AND v.doctor_id=$2 AND v.status='WITH_DOCTOR' AND v.id<>$3 ORDER BY v.updated_at LIMIT 1`,
+        [req.user.hospitalId, target.rows[0].doctor_id, req.params.id]
+      );
+      if (open.rowCount) throw badRequest(`Complete the visit of ${open.rows[0].full_name} first. A new visit can be started only after the one in progress is completed or sent to reception.`);
+    }
     const q = await client.query(
       `UPDATE visits SET status='WITH_DOCTOR',updated_at=NOW()
        WHERE id=$1 AND hospital_id=$2 AND status='WAITING_FOR_DOCTOR'
@@ -412,7 +426,7 @@ router.put('/:id/vitals', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
     if (!['WAITING_FOR_DOCTOR', 'WITH_DOCTOR', 'PAYMENT_PENDING'].includes(visit.status)) throw badRequest('Vitals can be changed only while the visit is open');
     if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
     const q = await client.query(
-      `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,vitals_updated_at=NOW(),updated_at=NOW()
+      `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,bp_systolic=$9,bp_diastolic=$10,vitals_updated_at=NOW(),updated_at=NOW()
        WHERE id=$1 AND hospital_id=$2 RETURNING ${VITALS_COLUMNS}`,
       [req.params.id, req.user.hospitalId, ...vitalsParams(data)]
     );
@@ -422,7 +436,7 @@ router.put('/:id/vitals', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
 }));
 
 router.put('/:id/doctor-notes', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
-  const data = z.object({ notes: z.string().max(5000), advice: z.string().max(1000).optional() }).parse(req.body);
+  const data = z.object({ notes: z.string().max(5000), advice: z.string().max(1000).optional(), followUpDays: z.number().int().min(1).max(365).nullable().optional() }).parse(req.body);
   const result = await withTransaction(async (client) => {
     const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
     if (visit.status !== 'WITH_DOCTOR') throw badRequest('Findings can be edited only while the patient is with the doctor');
@@ -435,9 +449,10 @@ router.put('/:id/doctor-notes', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHan
       [data.notes, req.user.id, req.params.id, req.user.hospitalId]
     );
     await client.query(
-      `UPDATE visit_doctors SET doctor_notes=NULLIF(trim($1),''),advice=CASE WHEN $5::text IS NULL THEN advice ELSE NULLIF(trim($5),'') END,updated_at=NOW()
+      `UPDATE visit_doctors SET doctor_notes=NULLIF(trim($1),''),advice=CASE WHEN $5::text IS NULL THEN advice ELSE NULLIF(trim($5),'') END,
+              follow_up_days=CASE WHEN $6::boolean THEN $7::smallint ELSE follow_up_days END,updated_at=NOW()
        WHERE hospital_id=$2 AND visit_id=$3 AND doctor_id=$4 AND status='IN_PROGRESS'`,
-      [data.notes, req.user.hospitalId, req.params.id, visit.doctor_id, data.advice ?? null]
+      [data.notes, req.user.hospitalId, req.params.id, visit.doctor_id, data.advice ?? null, data.followUpDays !== undefined, data.followUpDays ?? null]
     );
     return q.rows[0];
   });

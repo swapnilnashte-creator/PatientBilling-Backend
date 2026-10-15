@@ -1,6 +1,11 @@
 import app from './app.js';
 import { pool } from './db.js';
 import 'dotenv/config';
+import { cleanOldLogs, watchProcessErrors } from './errorLog.js';
+
+watchProcessErrors();
+cleanOldLogs();
+setInterval(cleanOldLogs, 24 * 60 * 60 * 1000).unref();
 
 const port = Number(process.env.PORT || 4000);
 const host = process.env.HOST || '0.0.0.0';

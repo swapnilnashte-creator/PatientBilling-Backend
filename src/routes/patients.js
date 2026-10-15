@@ -12,15 +12,17 @@ const patientSchema = z.object({
   mobile: mobileSchema,
   gender: z.enum(['MALE','FEMALE','OTHER','PREFER_NOT_TO_SAY']).nullable().optional(),
   dateOfBirth: z.string().date().nullable().optional(),
-  age: z.number().int().min(0).max(120).nullable().optional(),
+  age: z.number().int().min(0).max(365).nullable().optional(),
+  ageUnit: z.enum(['YEARS', 'MONTHS', 'DAYS']).optional(), // a baby's age is given in months or days
   address: z.string().max(1000).nullable().optional(),
 })
   // an exact birth date, or just the age in years (stored as an estimated birth date)
   .refine(d => d.dateOfBirth || (d.age !== null && d.age !== undefined), { message: 'Age or date of birth is required', path: ['age'] })
+  .refine(d => d.age === null || d.age === undefined || d.age <= ({ YEARS: 120, MONTHS: 59, DAYS: 365 })[d.ageUnit || 'YEARS'], { message: 'Age is too high for the chosen unit', path: ['age'] })
   .refine(d => !d.dateOfBirth || d.dateOfBirth <= new Date(Date.now() + 864e5).toISOString().slice(0, 10), { message: 'Date of birth cannot be in the future', path: ['dateOfBirth'] });
 
 // date_of_birth = the given date, or today minus the age when only an age was given
-const dobSql = (dobParam, ageParam) => `COALESCE($${dobParam}::date,(CURRENT_DATE-($${ageParam}::int*INTERVAL '1 year'))::date)`;
+const dobSql = (dobParam, ageParam, unitParam) => `COALESCE($${dobParam}::date,(CURRENT_DATE-($${ageParam}::int*CASE $${unitParam}::text WHEN 'MONTHS' THEN INTERVAL '1 month' WHEN 'DAYS' THEN INTERVAL '1 day' ELSE INTERVAL '1 year' END))::date)`;
 
 router.get('/search', asyncHandler(async (req, res) => {
   const term = String(req.query.q || '').trim();
@@ -78,9 +80,9 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
   await assertNotDuplicate(req.user.hospitalId, data.mobile, data.fullName);
   const q = await pool.query(
     `INSERT INTO patients(hospital_id,full_name,mobile,gender,date_of_birth,dob_estimated,address,created_by,updated_by)
-     VALUES($1,$2,$3,$4,${dobSql(5, 6)},$5::date IS NULL,$7,$8,$8)
+     VALUES($1,$2,$3,$4,${dobSql(5, 6, 9)},$5::date IS NULL,$7,$8,$8)
      RETURNING id,full_name,mobile,gender,date_of_birth,dob_estimated,address`,
-    [req.user.hospitalId, data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id]
+    [req.user.hospitalId, data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, data.ageUnit || 'YEARS']
   );
   res.status(201).json(q.rows[0]);
 }));
@@ -89,10 +91,10 @@ router.put('/:id', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) 
   const data = patientSchema.parse(req.body);
   await assertNotDuplicate(req.user.hospitalId, data.mobile, data.fullName, req.params.id);
   const q = await pool.query(
-    `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=${dobSql(4, 5)},dob_estimated=$4::date IS NULL,address=$6,updated_by=$7,updated_at=NOW()
+    `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=${dobSql(4, 5, 10)},dob_estimated=$4::date IS NULL,address=$6,updated_by=$7,updated_at=NOW()
      WHERE id=$8 AND hospital_id=$9 AND deleted_at IS NULL
      RETURNING id,full_name,mobile,gender,date_of_birth,dob_estimated,address`,
-    [data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, req.params.id, req.user.hospitalId]
+    [data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, req.params.id, req.user.hospitalId, data.ageUnit || 'YEARS']
   );
   if (!q.rowCount) throw notFound('Patient not found');
   res.json(q.rows[0]);
