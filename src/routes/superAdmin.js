@@ -9,6 +9,7 @@ import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
 import { mobileSchema } from '../mobile.js';
 import { addDays, todayString } from '../billing/pricing.js';
 import billingRoutes from './superAdminBilling.js';
+import { exportHospital, purgeHospital } from '../hospitalPurge.js';
 
 const router = Router();
 router.use(allow('SUPER_ADMIN'));
@@ -22,7 +23,6 @@ router.get('/hospitals', asyncHandler(async (_req, res) => {
             (SELECT COUNT(*)::int FROM users u WHERE u.hospital_id=h.id AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL) AS doctors,
             (SELECT COUNT(*)::int FROM patients p WHERE p.hospital_id=h.id AND p.deleted_at IS NULL) AS patients,
             (SELECT COUNT(*)::int FROM visits v WHERE v.hospital_id=h.id) AS visits,
-            (SELECT COALESCE(SUM(p.amount),0)::numeric(14,2) FROM payments p WHERE p.hospital_id=h.id) AS revenue,
             (SELECT MAX(v.created_at) FROM visits v WHERE v.hospital_id=h.id) AS last_visit_at
      FROM hospitals h
      LEFT JOIN LATERAL (
@@ -98,6 +98,34 @@ router.patch('/hospitals/:id/status', asyncHandler(async (req, res) => {
     return q.rows[0];
   });
   res.json(result);
+}));
+
+// Backup file of everything one hospital owns (offered before a delete)
+router.get('/hospitals/:id/export', asyncHandler(async (req, res) => {
+  const id = z.coerce.number().int().positive().parse(req.params.id);
+  const client = await pool.connect();
+  try {
+    const data = await exportHospital(client, id);
+    if (!data) throw notFound('Hospital not found');
+    res.json(data);
+  } finally { client.release(); }
+}));
+
+// Permanent delete of a hospital and all its data. Only a deactivated hospital with no open platform invoice, and only
+// when the hospital's exact name is typed.
+router.delete('/hospitals/:id', asyncHandler(async (req, res) => {
+  const id = z.coerce.number().int().positive().parse(req.params.id);
+  const data = z.object({ confirmName: z.string(), reason: z.string().trim().min(5).max(500) }).parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const h = (await client.query('SELECT id,name,is_active FROM hospitals WHERE id=$1 FOR UPDATE', [id])).rows[0];
+    if (!h) throw notFound('Hospital not found');
+    if (h.is_active) throw badRequest('Deactivate the hospital first. Only a deactivated hospital can be deleted.');
+    if (data.confirmName.trim() !== h.name) throw badRequest('The name typed does not match the hospital name.');
+    const open = await client.query(`SELECT COUNT(*)::int AS n FROM platform_invoices WHERE hospital_id=$1 AND status IN ('DRAFT','ISSUED')`, [id]);
+    if (open.rows[0].n) throw badRequest(`This hospital has ${open.rows[0].n} open invoice(s). Cancel or settle them first.`);
+    return purgeHospital(client, id, { superuserId: req.user.id, reason: data.reason });
+  });
+  res.json({ deleted: true, name: result.name });
 }));
 
 async function startImpersonation(req, res, hospitalId, userId) {
