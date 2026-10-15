@@ -16,7 +16,11 @@ if (!process.env.DATABASE_URL) {
 
 pool.query('SELECT 1')
   .then(() => {
-    app.listen(port, host, () => console.log(`API listening on ${host}:${port}`));
+    const server = app.listen(port, host, () => console.log(`API listening on ${host}:${port}`));
+    // Keep idle connections open longer than a reverse proxy does (usually 60 s). Node's default is 5 s, so the proxy
+    // would reuse a connection Node had just closed and the browser would show "Failed to fetch" on the first try.
+    server.keepAliveTimeout = 65000;
+    server.headersTimeout = 66000;
   })
   .catch((err) => {
     console.error('Database connection failed:', err.message);

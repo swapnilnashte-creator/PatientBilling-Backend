@@ -6,7 +6,12 @@ const { Pool } = pg;
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  keepAlive: true,
+  idleTimeoutMillis: 30000,
 });
+
+// A database connection that drops while idle must not crash the server (the next request just opens a new one)
+pool.on('error', (error) => console.error('Idle database connection error:', error.message));
 
 export async function withTransaction(fn) {
   const client = await pool.connect();
