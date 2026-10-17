@@ -117,6 +117,17 @@ router.patch('/:id/status', asyncHandler(async (req, res) => {
   res.json(result);
 }));
 
+// A user's name can be corrected. It changes everywhere the name is shown, including future printed bills, pads and certificates.
+router.patch('/:id/name', asyncHandler(async (req, res) => {
+  const { name } = z.object({ name: z.string().trim().min(2, 'Enter the user’s name').max(120) }).parse(req.body);
+  const q = await pool.query(
+    `UPDATE users SET name=$1,updated_at=NOW() WHERE id=$2 AND hospital_id=$3 AND deleted_at IS NULL RETURNING id,name,mobile,email,role,is_active`,
+    [name, req.params.id, req.user.hospitalId]
+  );
+  if (!q.rowCount) throw notFound('User not found');
+  res.json(q.rows[0]);
+}));
+
 router.patch('/:id/profile', asyncHandler(async (req, res) => {
   const { qualification, registrationNo } = z.object({ qualification: z.string().trim().max(160), registrationNo: z.string().trim().max(40).optional().default('') }).parse(req.body);
   const q = await pool.query(
