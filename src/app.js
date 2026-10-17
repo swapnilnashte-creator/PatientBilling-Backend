@@ -5,6 +5,10 @@ import helmet from 'helmet';
 import morgan from 'morgan';
 import 'dotenv/config';
 import authRoutes from './routes/auth.js';
+import vaccineRoutes from './routes/vaccines.js';
+import followUpRoutes from './routes/followUps.js';
+import reminderRoutes from './routes/reminders.js';
+import { displayAdmin, displayPublic } from './routes/display.js';
 import userRoutes from './routes/users.js';
 import patientRoutes from './routes/patients.js';
 import billingItemRoutes from './routes/billingItems.js';
@@ -58,8 +62,13 @@ if (process.env.NODE_ENV === 'production') {
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
+app.use('/api/display-public', displayPublic);
 app.use('/api/users', auth, userRoutes);
 app.use('/api/patients', auth, patientRoutes);
+app.use('/api/vaccines', auth, vaccineRoutes);
+app.use('/api/follow-ups', auth, followUpRoutes);
+app.use('/api/reminders', auth, reminderRoutes);
+app.use('/api/display-link', auth, displayAdmin);
 app.use('/api/billing-items', auth, billingItemRoutes);
 app.use('/api/visits', auth, visitRoutes);
 app.use('/api/dashboard', auth, dashboardRoutes);

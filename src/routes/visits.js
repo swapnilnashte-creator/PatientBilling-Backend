@@ -158,7 +158,9 @@ const VITALS_COLUMNS = 'weight_kg,height_cm,heart_rate,spo2,temperature,temperat
 const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.temperatureUnit, v.bpSystolic, v.bpDiastolic];
 const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.bpSystolic].some(x => x !== null && x !== undefined);
 
-router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {
+// Reception and Admin register visits for any doctor. A doctor can register a visit only for themselves (a patient who walked
+// straight into the cabin); it appears in the reception list like any other visit.
+router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req, res) => {
   const data = z.object({
     patientId: z.coerce.number().int().positive(),
     vitals: vitalsSchema.optional(),
@@ -166,7 +168,11 @@ router.post('/', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) =>
     doctorId: z.coerce.number().int().positive().optional(),
   }).parse(req.body);
 
-  const doctorIds = data.doctorIds || (data.doctorId ? [data.doctorId] : []);
+  let doctorIds = data.doctorIds || (data.doctorId ? [data.doctorId] : []);
+  if (req.user.role === 'DOCTOR') {
+    if (doctorIds.some(id => Number(id) !== Number(req.user.id))) throw forbidden('A doctor can create a visit only for themselves');
+    doctorIds = [Number(req.user.id)];
+  }
   if (!doctorIds.length) throw badRequest('Select at least one doctor');
 
   const check = await pool.query(
