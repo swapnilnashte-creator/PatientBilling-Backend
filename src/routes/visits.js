@@ -8,7 +8,7 @@ const router = Router();
 
 async function getVisit(client, hospitalId, visitId, lock = false) {
   const q = await client.query(
-    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,p.qr_code AS patient_qr_code,
+    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,p.qr_code AS patient_qr_code,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,
             d.name AS doctor_name,d.qualification AS doctor_qualification,d.registration_no AS doctor_registration_no
      FROM visits v
      JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
@@ -158,6 +158,41 @@ const VITALS_COLUMNS = 'weight_kg,height_cm,heart_rate,spo2,temperature,temperat
 const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.temperatureUnit, v.bpSystolic, v.bpDiastolic];
 const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.bpSystolic].some(x => x !== null && x !== undefined);
 
+// Creates a visit (visit number, daily token, doctors) inside the caller's transaction.
+export async function createVisitTx(client, hospitalId, userId, patientId, doctorIds) {
+  await validateDoctors(client, hospitalId, doctorIds);
+  const numberQ = await client.query(
+    `INSERT INTO hospital_visit_counters(hospital_id,next_number)
+     VALUES($1,2)
+     ON CONFLICT (hospital_id) DO UPDATE
+     SET next_number=hospital_visit_counters.next_number+1
+     RETURNING next_number-1 AS visit_number`,
+    [hospitalId]
+  );
+  // the daily token restarts at 1 each day (India time) for this hospital
+  const dailyQ = await client.query(
+    `INSERT INTO hospital_daily_visit_counters(hospital_id,day,next_number)
+     VALUES($1,(NOW() AT TIME ZONE 'Asia/Kolkata')::date,2)
+     ON CONFLICT (hospital_id,day) DO UPDATE
+     SET next_number=hospital_daily_visit_counters.next_number+1
+     RETURNING next_number-1 AS daily_number`,
+    [hospitalId]
+  );
+  const q = await client.query(
+    `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by)
+     VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, patientId, doctorIds[0], userId]
+  );
+  for (let index = 0; index < doctorIds.length; index += 1) {
+    await client.query(
+      `INSERT INTO visit_doctors(hospital_id,visit_id,doctor_id,position)
+       VALUES($1,$2,$3,$4)`,
+      [hospitalId, q.rows[0].id, doctorIds[index], index + 1]
+    );
+  }
+  return q.rows[0];
+}
+
 // Reception and Admin register visits for any doctor. A doctor can register a visit only for themselves (a patient who walked
 // straight into the cabin); it appears in the reception list like any other visit.
 router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req, res) => {
@@ -186,44 +221,15 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
   if (!check.rows[0].has_age) throw badRequest('Age or date of birth is required to register a visit');
   if (!check.rows[0].has_gender) throw badRequest('Gender is required to register a visit');
   const visit = await withTransaction(async (client) => {
-    await validateDoctors(client, req.user.hospitalId, doctorIds);
-    const numberQ = await client.query(
-      `INSERT INTO hospital_visit_counters(hospital_id,next_number)
-       VALUES($1,2)
-       ON CONFLICT (hospital_id) DO UPDATE
-       SET next_number=hospital_visit_counters.next_number+1
-       RETURNING next_number-1 AS visit_number`,
-      [req.user.hospitalId]
-    );
-    // the daily token restarts at 1 each day (India time) for this hospital
-    const dailyQ = await client.query(
-      `INSERT INTO hospital_daily_visit_counters(hospital_id,day,next_number)
-       VALUES($1,(NOW() AT TIME ZONE 'Asia/Kolkata')::date,2)
-       ON CONFLICT (hospital_id,day) DO UPDATE
-       SET next_number=hospital_daily_visit_counters.next_number+1
-       RETURNING next_number-1 AS daily_number`,
-      [req.user.hospitalId]
-    );
-    const q = await client.query(
-      `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [req.user.hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, data.patientId, doctorIds[0], req.user.id]
-    );
-    for (let index = 0; index < doctorIds.length; index += 1) {
-      await client.query(
-        `INSERT INTO visit_doctors(hospital_id,visit_id,doctor_id,position)
-         VALUES($1,$2,$3,$4)`,
-        [req.user.hospitalId, q.rows[0].id, doctorIds[index], index + 1]
-      );
-    }
+    const created = await createVisitTx(client, req.user.hospitalId, req.user.id, data.patientId, doctorIds);
     if (data.vitals && anyVital(data.vitals)) {
       const v = await client.query(
         `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,bp_systolic=$9,bp_diastolic=$10,vitals_updated_at=NOW() WHERE id=$1 AND hospital_id=$2 RETURNING *`,
-        [q.rows[0].id, req.user.hospitalId, ...vitalsParams(data.vitals)]
+        [created.id, req.user.hospitalId, ...vitalsParams(data.vitals)]
       );
       return v.rows[0];
     }
-    return q.rows[0];
+    return created;
   });
   res.status(201).json(visit);
 }));
@@ -288,7 +294,7 @@ router.get('/', asyncHandler(async (req, res) => {
   }
   const q = await pool.query(
     `SELECT v.id,v.visit_number,v.daily_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
-            p.id AS patient_id,p.full_name,p.mobile,d.name AS doctor_name,
+            p.id AS patient_id,p.full_name,p.mobile,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,d.name AS doctor_name,
             (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status,'started_at',vd.started_at,'completed_at',vd.completed_at) ORDER BY vd.position)
              FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
              WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id) AS doctors,

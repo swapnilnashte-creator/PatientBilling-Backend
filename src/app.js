@@ -9,6 +9,7 @@ import vaccineRoutes from './routes/vaccines.js';
 import followUpRoutes from './routes/followUps.js';
 import reminderRoutes from './routes/reminders.js';
 import { displayAdmin, displayPublic } from './routes/display.js';
+import allergyRoutes from './routes/allergies.js';
 import userRoutes from './routes/users.js';
 import patientRoutes from './routes/patients.js';
 import billingItemRoutes from './routes/billingItems.js';
@@ -23,9 +24,16 @@ import certificateRoutes from './routes/certificates.js';
 import findingTemplateRoutes from './routes/findingTemplates.js';
 import subscriptionRoutes from './routes/subscription.js';
 import superAdminRoutes from './routes/superAdmin.js';
+import bookingPublic from './routes/booking.js';
+import appointmentRoutes from './routes/appointments.js';
 import { auth } from './middleware/auth.js';
+import { proxyWatch, startupProxyNotes, trustProxySetting } from './proxyCheck.js';
 
 const app = express();
+// behind a reverse proxy (nginx, Cloudflare) set TRUST_PROXY=1 so each visitor's own address is seen, not the proxy's
+app.set('trust proxy', trustProxySetting());
+for (const note of startupProxyNotes()) console.warn(`[proxy] ${note}`);
+app.use(proxyWatch(app));
 app.use(helmet());
 const configuredOrigins = new Set(
   String(process.env.FRONTEND_ORIGIN || 'http://localhost:5173')
@@ -63,11 +71,14 @@ if (process.env.NODE_ENV === 'production') {
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/display-public', displayPublic);
+app.use('/api/public-booking', bookingPublic);
 app.use('/api/users', auth, userRoutes);
 app.use('/api/patients', auth, patientRoutes);
 app.use('/api/vaccines', auth, vaccineRoutes);
 app.use('/api/follow-ups', auth, followUpRoutes);
 app.use('/api/reminders', auth, reminderRoutes);
+app.use('/api/allergies', auth, allergyRoutes);
+app.use('/api/appointments', auth, appointmentRoutes);
 app.use('/api/display-link', auth, displayAdmin);
 app.use('/api/billing-items', auth, billingItemRoutes);
 app.use('/api/visits', auth, visitRoutes);
@@ -98,7 +109,8 @@ app.use((err, req, res, _next) => {
     });
   }
 
-  const status = Number.isInteger(err?.status) &&
+  const status =
+    Number.isInteger(err?.status) &&
     err.status >= 400 &&
     err.status <= 599
       ? err.status
@@ -107,6 +119,9 @@ app.use((err, req, res, _next) => {
   if (status < 500) {
     return res.status(status).json({
       message: err.message || 'Request failed',
+      ...(err.needDetails ? { needDetails: true } : {}),
+      ...(err.duplicate ? { duplicate: true } : {}),
+      ...(err.openVisit ? { openVisit: err.openVisit } : {}),
     });
   }
 
@@ -117,13 +132,15 @@ app.use((err, req, res, _next) => {
     url: req.originalUrl,
     status,
     user: req.user
-      ? `${req.user.role} ${req.user.id}${req.user.hospitalId
-          ? ` (hospital ${req.user.hospitalId})`
-          : ''}`
+      ? `${req.user.role} ${req.user.id}${
+          req.user.hospitalId
+            ? ` (hospital ${req.user.hospitalId})`
+            : ''
+        }`
       : '',
   });
 
-  return res.status(status).json({
+    return res.status(status).json({
     message: `Something went wrong on our side. Please try again. If it keeps happening, tell support this reference: ${ref}`,
     ref,
   });

@@ -2,6 +2,8 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
+import { loginGuard } from '../loginGuard.js';
+import { isLoopback, overLimit } from '../hitLimiter.js';
 import { pool, withTransaction } from '../db.js';
 import { asyncHandler, badRequest } from '../utils.js';
 import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
@@ -26,7 +28,15 @@ router.get('/support', asyncHandler(async (_req, res) => {
   res.json({ name: r.name || 'DhaCare', phone: r.support_phone || '', email: r.support_email || '' });
 }));
 
-router.post('/register-hospital', asyncHandler(async (req, res) => {
+// Anyone can register a hospital, so a script could create thousands. Five an hour from one address, and forty an hour for the whole platform.
+const registerGuard = (req, res, next) => {
+  if (process.env.NODE_ENV !== 'production' && isLoopback(req.ip)) return next();
+  const wait = overLimit(`register:${req.ip}`, 5, 3600e3) || overLimit('register:all', 40, 3600e3);
+  if (wait) { console.warn(`Hospital registration blocked for ${wait}s (address ${req.ip})`); res.set('Retry-After', String(wait)); return res.status(429).json({ message: 'Too many registrations from this address. Please try again later, or contact DhaCare.' }); }
+  next();
+};
+
+router.post('/register-hospital', registerGuard, asyncHandler(async (req, res) => {
   const data = registerSchema.parse(req.body);
   const reservedMobile = await pool.query(`SELECT id FROM platform_superusers WHERE mobile=$1`, [data.adminMobile]);
   if (reservedMobile.rowCount) throw badRequest('This mobile number is reserved for a platform account');
@@ -74,7 +84,7 @@ function sessionFor(user) {
   };
 }
 
-router.post('/login', asyncHandler(async (req, res) => {
+router.post('/login', loginGuard, asyncHandler(async (req, res) => {
   const data = loginSchema.parse(req.body);
   const superQ = await pool.query(
     `SELECT id,name,mobile,email,password_hash FROM platform_superusers
@@ -84,7 +94,7 @@ router.post('/login', asyncHandler(async (req, res) => {
   if (superQ.rowCount === 1) {
     const superuser = superQ.rows[0];
     const ok = await bcrypt.compare(data.password, superuser.password_hash);
-    if (!ok) throw badRequest('Invalid mobile number or password');
+    if (!ok) { res.locals.loginFailed = true; throw badRequest('Invalid mobile number or password'); }
     const token = jwt.sign(
       { role: 'SUPER_ADMIN', name: superuser.name },
       process.env.JWT_SECRET,
@@ -105,7 +115,7 @@ router.post('/login', asyncHandler(async (req, res) => {
   for (const user of q.rows) {
     if (await bcrypt.compare(data.password, user.password_hash)) validatedUsers.push(user);
   }
-  if (!validatedUsers.length) throw badRequest('Invalid mobile number or password');
+  if (!validatedUsers.length) { res.locals.loginFailed = true; throw badRequest('Invalid mobile number or password'); }
   if (validatedUsers.length === 1) return res.json(sessionFor(validatedUsers[0]));
 
   const selectionToken = jwt.sign(
