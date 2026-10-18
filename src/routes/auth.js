@@ -2,6 +2,7 @@ import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
+import { loginGuard } from '../loginGuard.js';
 import { pool, withTransaction } from '../db.js';
 import { asyncHandler, badRequest } from '../utils.js';
 import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
@@ -74,7 +75,7 @@ function sessionFor(user) {
   };
 }
 
-router.post('/login', asyncHandler(async (req, res) => {
+router.post('/login', loginGuard, asyncHandler(async (req, res) => {
   const data = loginSchema.parse(req.body);
   const superQ = await pool.query(
     `SELECT id,name,mobile,email,password_hash FROM platform_superusers
@@ -84,7 +85,7 @@ router.post('/login', asyncHandler(async (req, res) => {
   if (superQ.rowCount === 1) {
     const superuser = superQ.rows[0];
     const ok = await bcrypt.compare(data.password, superuser.password_hash);
-    if (!ok) throw badRequest('Invalid mobile number or password');
+    if (!ok) { res.locals.loginFailed = true; throw badRequest('Invalid mobile number or password'); }
     const token = jwt.sign(
       { role: 'SUPER_ADMIN', name: superuser.name },
       process.env.JWT_SECRET,
@@ -105,7 +106,7 @@ router.post('/login', asyncHandler(async (req, res) => {
   for (const user of q.rows) {
     if (await bcrypt.compare(data.password, user.password_hash)) validatedUsers.push(user);
   }
-  if (!validatedUsers.length) throw badRequest('Invalid mobile number or password');
+  if (!validatedUsers.length) { res.locals.loginFailed = true; throw badRequest('Invalid mobile number or password'); }
   if (validatedUsers.length === 1) return res.json(sessionFor(validatedUsers[0]));
 
   const selectionToken = jwt.sign(

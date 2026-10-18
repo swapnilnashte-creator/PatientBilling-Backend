@@ -10,10 +10,14 @@ import { mobileSchema } from '../mobile.js';
 import { addDays, todayString } from '../billing/pricing.js';
 import billingRoutes from './superAdminBilling.js';
 import { exportHospital, purgeHospital } from '../hospitalPurge.js';
+import { networkReport } from '../proxyCheck.js';
 
 const router = Router();
 router.use(allow('SUPER_ADMIN'));
 router.use('/billing', billingRoutes);
+
+// Does the server see each visitor's own address? (the booking and sign-in limits depend on it)
+router.get('/network-check', (req, res) => { res.json(networkReport(req, req.app)); });
 
 router.get('/hospitals', asyncHandler(async (_req, res) => {
   const q = await pool.query(

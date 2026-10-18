@@ -210,7 +210,7 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
        FROM visit_doctors vd JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
        WHERE vd.hospital_id=$1 AND vd.visit_id=ANY($2::bigint[]) ORDER BY vd.visit_id,vd.position`, [hospitalId, ids]),
     clinical ? pool.query(
-      `SELECT pi.visit_id,pi.doctor_id,u.name AS doctor_name,pi.name,pi.dose,pi.timing,pi.duration_days,pi.note
+      `SELECT pi.visit_id,pi.doctor_id,u.name AS doctor_name,pi.name,pi.composition,pi.dose,pi.timing,pi.duration_days,pi.note
        FROM visit_prescription_items pi JOIN users u ON u.id=pi.doctor_id AND u.hospital_id=pi.hospital_id
        WHERE pi.hospital_id=$1 AND pi.visit_id=ANY($2::bigint[]) ORDER BY pi.visit_id,pi.doctor_id,pi.position`, [hospitalId, ids]) : none,
     money ? pool.query(
@@ -245,7 +245,7 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
     };
     if (clinical) {
       row.vitals = { weight_kg: v.weight_kg, height_cm: v.height_cm, heart_rate: v.heart_rate, spo2: v.spo2, temperature: v.temperature, temperature_unit: v.temperature_unit, bp_systolic: v.bp_systolic, bp_diastolic: v.bp_diastolic };
-      row.prescription = (rx.get(k) || []).map(r => ({ name: r.name, dose: r.dose, timing: r.timing, days: r.duration_days, note: r.note, doctorName: r.doctor_name }));
+      row.prescription = (rx.get(k) || []).map(r => ({ name: r.name, composition: r.composition, dose: r.dose, timing: r.timing, days: r.duration_days, note: r.note, doctorName: r.doctor_name }));
     }
     if (money) {
       row.bill = { items, total: Math.round(billed * 100) / 100, unpaid, payment: pay ? { amount: Number(pay.amount), mode: pay.payment_mode, reference: pay.reference_no, paidAt: pay.paid_at, acceptedBy: pay.accepted_by } : null };
