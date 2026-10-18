@@ -147,6 +147,8 @@ const COLUMNS = `a.id,a.reference,a.doctor_id,u.name AS doctor_name,a.slot_at,to
   to_char(a.slot_at AT TIME ZONE 'Asia/Kolkata','HH24:MI') AS time,a.patient_id,a.full_name,a.mobile,a.gender,
   to_char(a.date_of_birth,'YYYY-MM-DD') AS date_of_birth,a.dob_estimated,a.reasons,a.reason_note,a.severity,a.status,a.source,a.visit_id,a.created_at,
   v.daily_number AS token,
+  (SELECT COUNT(*)::int FROM appointments n WHERE n.hospital_id=a.hospital_id AND n.mobile=a.mobile AND n.status='NO_SHOW' AND n.slot_day > (NOW() AT TIME ZONE 'Asia/Kolkata')::date - 30) AS earlier_no_shows,
+  EXISTS (SELECT 1 FROM blocked_mobiles bm WHERE bm.hospital_id=a.hospital_id AND bm.mobile=a.mobile) AS blocked,
   (a.status='ARRIVED' AND v.status='WAITING_FOR_DOCTOR'
     AND NOT EXISTS (SELECT 1 FROM visit_doctors vd WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id AND vd.status<>'WAITING')
     AND NOT EXISTS (SELECT 1 FROM payments py WHERE py.hospital_id=v.hospital_id AND py.visit_id=v.id)) AS can_undo`;
@@ -181,6 +183,32 @@ router.get('/by-ref/:ref', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandle
   const q = await pool.query(`SELECT id,reference,to_char(slot_day,'YYYY-MM-DD') AS day,status FROM appointments WHERE hospital_id=$1 AND reference=$2${extra}`, params);
   if (!q.rowCount) throw notFound('This booking was not found in this hospital');
   res.json({ ...q.rows[0], id: Number(q.rows[0].id) });
+}));
+
+// Block a mobile number from booking online (and cancel what it still has booked). For spam, or a patient who keeps not coming.
+router.post('/:id/block-mobile', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const q = await client.query('SELECT mobile FROM appointments WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.params.id]);
+    if (!q.rowCount) throw notFound('Appointment not found');
+    const mobile = q.rows[0].mobile;
+    await client.query('INSERT INTO blocked_mobiles(hospital_id,mobile,blocked_by) VALUES($1,$2,$3) ON CONFLICT (hospital_id,mobile) DO NOTHING', [req.user.hospitalId, mobile, req.user.id]);
+    const c = await client.query(`UPDATE appointments SET status='CANCELLED',status_by=$3,status_at=NOW() WHERE hospital_id=$1 AND mobile=$2 AND status='BOOKED'`, [req.user.hospitalId, mobile, req.user.id]);
+    return { mobile, cancelled: c.rowCount };
+  });
+  res.json(result);
+}));
+router.get('/blocked', allow('ADMIN'), asyncHandler(async (req, res) => {
+  const q = await pool.query('SELECT id,mobile,created_at FROM blocked_mobiles WHERE hospital_id=$1 ORDER BY created_at DESC', [req.user.hospitalId]);
+  res.json(q.rows.map(r => ({ ...r, id: Number(r.id) })));
+}));
+router.delete('/blocked/:id', allow('ADMIN'), asyncHandler(async (req, res) => {
+  await pool.query('DELETE FROM blocked_mobiles WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.params.id]);
+  res.json({ ok: true });
+}));
+// shown as a warning on the Appointments page
+router.get('/security', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
+  const q = await pool.query(`SELECT COUNT(*)::int AS n FROM booking_hits WHERE hospital_id=$1 AND kind='cap' AND created_at > NOW() - INTERVAL '1 day'`, [req.user.hospitalId]);
+  res.json({ pausedCount: q.rows[0].n });
 }));
 
 // number of bookings still waiting today (for the menu)

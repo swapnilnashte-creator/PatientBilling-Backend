@@ -29,6 +29,8 @@ export async function hospitalReasons(hospitalId, db = pool) {
   return q.rows;
 }
 
+// the most bookings one hospital takes online in an hour and in a day; beyond that booking pauses and the staff are warned
+export const BURST = { perHour: 40, perDay: 300 };
 const MIN_FILL_MS = 4000;          // a person needs a few seconds to fill the form; a script does not
 const MAX_FILL_MS = 3 * 3600e3;
 const hash = (value) => crypto.createHmac('sha256', SECRET()).update(String(value)).digest('hex');
@@ -236,6 +238,15 @@ router.post('/h/:slug/book', asyncHandler(async (req, res) => {
 
   // the captcha, then limits per device and per mobile number
   if (!(await verifyCaptcha(d.captcha, req.ip))) throw badRequest('Please complete the check ("I am not a robot") and try again.');
+  // a number the hospital has blocked gets the same plain refusal as any other failure
+  const blocked = await pool.query('SELECT 1 FROM blocked_mobiles WHERE hospital_id=$1 AND mobile=$2', [hospital.id, who.mobile]);
+  if (blocked.rowCount) throw badRequest('We could not accept this booking. Please call the hospital.');
+  // unusually many bookings at once: pause online booking for this hospital for a while and tell the staff
+  const burst = await pool.query(`SELECT COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour')::int AS h, COUNT(*)::int AS d FROM appointments WHERE hospital_id=$1 AND created_at > NOW() - INTERVAL '1 day'`, [hospital.id]);
+  if (burst.rows[0].h >= BURST.perHour || burst.rows[0].d >= BURST.perDay) {
+    await pool.query(`INSERT INTO booking_hits(hospital_id,kind,key_hash) VALUES($1,'cap','cap')`, [hospital.id]);
+    throw Object.assign(new Error('Online booking is very busy right now. Please try again later, or call the hospital.'), { status: 429 });
+  }
   const ipKey = hash(`ip:${req.ip}`);
   const mobileKey = hash(`mobile:${hospital.id}:${who.mobile}`);
   if (await tooMany(hospital.id, 'ip', ipKey, 30, `INTERVAL '1 hour'`) || await tooMany(hospital.id, 'mobile', mobileKey, 6, `INTERVAL '1 day'`)) {

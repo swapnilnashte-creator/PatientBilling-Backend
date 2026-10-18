@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import { loginGuard } from '../loginGuard.js';
+import { isLoopback, overLimit } from '../hitLimiter.js';
 import { pool, withTransaction } from '../db.js';
 import { asyncHandler, badRequest } from '../utils.js';
 import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
@@ -27,7 +28,15 @@ router.get('/support', asyncHandler(async (_req, res) => {
   res.json({ name: r.name || 'DhaCare', phone: r.support_phone || '', email: r.support_email || '' });
 }));
 
-router.post('/register-hospital', asyncHandler(async (req, res) => {
+// Anyone can register a hospital, so a script could create thousands. Five an hour from one address, and forty an hour for the whole platform.
+const registerGuard = (req, res, next) => {
+  if (process.env.NODE_ENV !== 'production' && isLoopback(req.ip)) return next();
+  const wait = overLimit(`register:${req.ip}`, 5, 3600e3) || overLimit('register:all', 40, 3600e3);
+  if (wait) { console.warn(`Hospital registration blocked for ${wait}s (address ${req.ip})`); res.set('Retry-After', String(wait)); return res.status(429).json({ message: 'Too many registrations from this address. Please try again later, or contact DhaCare.' }); }
+  next();
+};
+
+router.post('/register-hospital', registerGuard, asyncHandler(async (req, res) => {
   const data = registerSchema.parse(req.body);
   const reservedMobile = await pool.query(`SELECT id FROM platform_superusers WHERE mobile=$1`, [data.adminMobile]);
   if (reservedMobile.rowCount) throw badRequest('This mobile number is reserved for a platform account');
