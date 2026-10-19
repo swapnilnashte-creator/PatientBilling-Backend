@@ -37,6 +37,8 @@ export function proxyWatch(app) {
 }
 
 // What the Super Admin sees on the Network check page.
+const plain = (ip) => String(ip || '').replace(/^::ffff:/, '').trim();
+
 export function networkReport(req, app) {
   const t = app.get('trust proxy');
   const header = (n) => (req.headers[n] ? String(req.headers[n]) : '');
@@ -47,6 +49,11 @@ export function networkReport(req, app) {
   let verdict = 'OK';
   if (hasProxyHeader && !t) { verdict = 'WRONG'; notes.push(`Your request came through a proxy, but TRUST_PROXY is not set. The server sees ${req.ip} (the proxy), not your own address. Every visitor would share this address and its limits.`); }
   else if (!hasProxyHeader && t) { verdict = 'CHECK'; notes.push('TRUST_PROXY is set, but this request has no forwarded-address header. Either there is no proxy in front of the server, or the proxy does not pass X-Forwarded-For.'); }
+  else if (hasProxyHeader && t && seen.cloudflare && plain(seen.cloudflare) !== plain(req.ip)) {
+    // Cloudflare says who the visitor is; if the server sees something else, it is looking at Cloudflare or Nginx, not the visitor
+    verdict = 'WRONG';
+    notes.push(`Cloudflare reports your address as ${plain(seen.cloudflare)}, but the server sees ${plain(req.ip)}. The server is looking at a proxy address, not the visitor, so every visitor would share it. Check that Nginx reads the visitor address from Cloudflare and passes it on, and that TRUST_PROXY matches the number of proxies.`);
+  } else if (hasProxyHeader && t && seen.cloudflare) notes.push(`Good: the server sees ${plain(req.ip)}, the same address Cloudflare reports for you.`);
   else if (hasProxyHeader && t) notes.push(`Good: the server reads the visitor address from the proxy and sees ${req.ip}. Compare it with your own public address (search "what is my IP") to be sure it matches.`);
   else notes.push(`No proxy detected. The server sees ${req.ip} directly.`);
   if (String(t) === 'true') verdict = verdict === 'OK' ? 'CHECK' : verdict;
