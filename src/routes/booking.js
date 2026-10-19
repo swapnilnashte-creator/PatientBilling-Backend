@@ -299,4 +299,87 @@ router.post('/h/:slug/book', asyncHandler(async (req, res) => {
   res.status(201).json({ reference: row.reference, doctorName: row.doctorName, hospitalName: hospital.name, slotAt: slotAt.toISOString(), day, time });
 }));
 
+// ---- the patient moves their own booking to another time ----
+// Who may: whoever knows the booking number AND the mobile number it was made with. Only a booking that is still waiting, up to an hour
+// before its time, and at most twice. The doctor stays the same. Every try is counted per device, so the pair cannot be guessed.
+export const RESCHEDULE = { max: 2, cutoffMinutes: 60 };
+const manageSchema = z.object({ reference: z.string().trim().toUpperCase().regex(/^[A-Z0-9]{8}$/), mobile: mobileSchema });
+const NOT_FOUND = 'We could not find a booking with this booking number and mobile number. Please check both and try again.';
+
+async function ownBooking(db, hospital, d) {
+  const q = await db.query(
+    `SELECT a.id,a.doctor_id,a.slot_at,a.reschedule_count,u.name AS doctor_name,u.qualification,u.booking_code
+     FROM appointments a JOIN users u ON u.hospital_id=a.hospital_id AND u.id=a.doctor_id
+     WHERE a.hospital_id=$1 AND a.reference=$2 AND a.mobile=$3 AND a.status='BOOKED'`, [hospital.id, d.reference, d.mobile]);
+  return q.rows[0] || null;
+}
+function canMove(row) {
+  if (new Date(row.slot_at).getTime() - Date.now() < RESCHEDULE.cutoffMinutes * 60000) return { ok: false, reason: `A booking can be changed up to ${RESCHEDULE.cutoffMinutes} minutes before its time. Please call the hospital.` };
+  if (row.reschedule_count >= RESCHEDULE.max) return { ok: false, reason: 'This booking has already been changed twice. Please call the hospital to change it again.' };
+  return { ok: true, reason: '' };
+}
+async function manageLimit(hospital, req) {
+  const key = hash(`manage:${req.ip}`);
+  if (await tooMany(hospital.id, 'manage', key, 25, `INTERVAL '1 hour'`)) throw Object.assign(new Error('Too many tries. Please wait a while, or call the hospital.'), { status: 429 });
+  await pool.query(`INSERT INTO booking_hits(hospital_id,kind,key_hash) VALUES($1,'manage',$2)`, [hospital.id, key]);
+}
+
+router.post('/h/:slug/manage/find', asyncHandler(async (req, res) => {
+  const hospital = await hospitalBySlug(req.params.slug);
+  const parsed = manageSchema.safeParse(req.body);
+  await manageLimit(hospital, req);
+  if (!parsed.success) throw notFound(NOT_FOUND);
+  const row = await ownBooking(pool, hospital, parsed.data);
+  if (!row) throw notFound(NOT_FOUND);
+  const can = canMove(row);
+  res.json({
+    doctor: { code: row.booking_code, name: row.doctor_name, qualification: row.qualification || '' },
+    day: istDay(row.slot_at), time: istTime(row.slot_at), slotAt: new Date(row.slot_at).toISOString(),
+    canChange: can.ok, reason: can.reason, changesLeft: Math.max(0, RESCHEDULE.max - row.reschedule_count),
+  });
+}));
+
+router.post('/h/:slug/manage/reschedule', asyncHandler(async (req, res) => {
+  const hospital = await hospitalBySlug(req.params.slug);
+  if (!captchaReady()) throw Object.assign(new Error('Online booking is not available right now. Please call the hospital.'), { status: 503 });
+  const d = manageSchema.extend({ slotAt: z.string().datetime({ offset: true }), stamp: z.string().max(100), captcha: z.string().max(4096).optional().default(''), website: z.string().max(200).optional().default('') }).parse(req.body);
+  if (d.website) throw badRequest('We could not accept this change. Please try again.');
+  if (!checkStamp(d.stamp)) throw badRequest('That was too quick, or the page was open too long. Please reload the page and try again.');
+  if (!(await verifyCaptcha(d.captcha, req.ip))) throw badRequest('Please complete the check ("I am not a robot") and try again.');
+  await manageLimit(hospital, req);
+  const slotAt = new Date(d.slotAt);
+  const day = istDay(slotAt); const time = istTime(slotAt);
+  const out = await withTransaction(async (client) => {
+    const own = await ownBooking(client, hospital, d);
+    if (!own) throw notFound(NOT_FOUND);
+    // two people changing into the last place of a slot are served one after the other
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`appt:${hospital.id}:${own.doctor_id}`]);
+    const can = canMove(own);
+    if (!can.ok) throw badRequest(can.reason);
+    if (new Date(own.slot_at).getTime() === slotAt.getTime()) throw badRequest('That is the time you already have. Please choose another.');
+    const doc = await client.query(`SELECT 1 FROM users u WHERE u.hospital_id=$1 AND u.id=$2 AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL AND u.online_booking=TRUE`, [hospital.id, own.doctor_id]);
+    if (!doc.rowCount) throw badRequest('This doctor is not taking online bookings. Please call the hospital.');
+    if (!bookableDays(hospital.booking_advance_days).includes(day) || slotAt.getTime() <= Date.now() + RESCHEDULE.cutoffMinutes * 60000) throw badRequest('That time is not open for booking. Please choose another.');
+    const sched = (await client.query(
+      `SELECT weekday,to_char(start_time,'HH24:MI') AS start,to_char(end_time,'HH24:MI') AS "end",slot_minutes AS "slotMinutes",per_slot AS "perSlot"
+       FROM doctor_schedules WHERE hospital_id=$1 AND doctor_id=$2`, [hospital.id, own.doctor_id])).rows;
+    const slot = slotsOfDay(day, sched, await hospitalHours(hospital.id, client)).find(x => x.time === time);
+    const off = await client.query(`SELECT 1 FROM doctor_days_off WHERE hospital_id=$1 AND doctor_id=$2 AND day=$3`, [hospital.id, own.doctor_id, day]);
+    if (!slot || off.rowCount) throw badRequest('That time is not open for booking. Please choose another.');
+    const used = await client.query(`SELECT COUNT(*)::int AS n FROM appointments WHERE hospital_id=$1 AND doctor_id=$2 AND slot_at=$3 AND status IN ('BOOKED','ARRIVED')`, [hospital.id, own.doctor_id, slotAt]);
+    if (used.rows[0].n >= slot.perSlot) throw Object.assign(new Error('Sorry, that time was just taken. Please choose another.'), { status: 409 });
+    try {
+      // the booking number stays the same; the staff see that it was moved, and an old WhatsApp message no longer matches
+      await client.query(
+        `UPDATE appointments SET slot_at=$3,slot_day=$4,previous_slot_at=slot_at,reschedule_count=reschedule_count+1,whatsapp_sent_at=NULL,whatsapp_sent_by=NULL WHERE hospital_id=$1 AND id=$2`,
+        [hospital.id, own.id, slotAt, day]);
+    } catch (err) {
+      if (err.code === '23505') throw Object.assign(new Error('You already have another appointment with this doctor on that day. Please choose another day.'), { status: 409 });
+      throw err;
+    }
+    return { doctorName: own.doctor_name, left: Math.max(0, RESCHEDULE.max - own.reschedule_count - 1) };
+  });
+  res.json({ reference: d.reference, doctorName: out.doctorName, hospitalName: hospital.name, slotAt: slotAt.toISOString(), day, time, changesLeft: out.left });
+}));
+
 export default router;

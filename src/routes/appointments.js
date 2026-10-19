@@ -129,6 +129,29 @@ router.delete('/days-off/:id', allow('ADMIN'), asyncHandler(async (req, res) => 
   res.json(await readSettings(req.user.hospitalId));
 }));
 
+// ---- the WhatsApp message for a booking ----
+export const DEFAULT_APPOINTMENT_MESSAGE = 'Hello {patient}, this is {hospital}. Your appointment with {doctor} is booked for {date} at {time}. Booking no. {reference}. Please show the QR or this number at the counter. To change it, please call us.';
+router.get('/message', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (req, res) => {
+  const q = await pool.query('SELECT appointment_message FROM hospitals WHERE id=$1', [req.user.hospitalId]);
+  res.json({ message: q.rows[0]?.appointment_message || null, defaultMessage: DEFAULT_APPOINTMENT_MESSAGE });
+}));
+// an empty message goes back to the standard wording
+router.put('/message', allow('ADMIN'), asyncHandler(async (req, res) => {
+  const { message } = z.object({ message: z.string().trim().max(600) }).parse(req.body);
+  await pool.query('UPDATE hospitals SET appointment_message=$2 WHERE id=$1', [req.user.hospitalId, message || null]);
+  res.json({ message: message || null, defaultMessage: DEFAULT_APPOINTMENT_MESSAGE });
+}));
+// staff opened WhatsApp for this booking: remember who and when, so nobody sends it twice by accident
+router.post('/:id/whatsapp-sent', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
+  const q = await pool.query('UPDATE appointments SET whatsapp_sent_at=NOW(),whatsapp_sent_by=$3 WHERE hospital_id=$1 AND id=$2 RETURNING whatsapp_sent_at', [req.user.hospitalId, req.params.id, req.user.id]);
+  if (!q.rowCount) throw notFound('Appointment not found');
+  res.json({ sentAt: q.rows[0].whatsapp_sent_at, sentBy: req.user.name });
+}));
+router.post('/:id/whatsapp-unsent', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
+  await pool.query('UPDATE appointments SET whatsapp_sent_at=NULL,whatsapp_sent_by=NULL WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.params.id]);
+  res.json({ ok: true });
+}));
+
 // ---- the reasons patients choose from ----
 router.get('/reasons', allow('ADMIN'), asyncHandler(async (req, res) => { res.json(await hospitalReasons(req.user.hospitalId)); }));
 router.put('/reasons', allow('ADMIN'), asyncHandler(async (req, res) => {
@@ -147,6 +170,8 @@ const COLUMNS = `a.id,a.reference,a.doctor_id,u.name AS doctor_name,a.slot_at,to
   to_char(a.slot_at AT TIME ZONE 'Asia/Kolkata','HH24:MI') AS time,a.patient_id,a.full_name,a.mobile,a.gender,
   to_char(a.date_of_birth,'YYYY-MM-DD') AS date_of_birth,a.dob_estimated,a.reasons,a.reason_note,a.severity,a.status,a.source,a.visit_id,a.created_at,
   v.daily_number AS token,
+  a.reschedule_count,a.previous_slot_at,
+  a.whatsapp_sent_at,(SELECT su.name FROM users su WHERE su.hospital_id=a.hospital_id AND su.id=a.whatsapp_sent_by) AS whatsapp_sent_by_name,
   (SELECT COUNT(*)::int FROM appointments n WHERE n.hospital_id=a.hospital_id AND n.mobile=a.mobile AND n.status='NO_SHOW' AND n.slot_day > (NOW() AT TIME ZONE 'Asia/Kolkata')::date - 30) AS earlier_no_shows,
   EXISTS (SELECT 1 FROM blocked_mobiles bm WHERE bm.hospital_id=a.hospital_id AND bm.mobile=a.mobile) AS blocked,
   (a.status='ARRIVED' AND v.status='WAITING_FOR_DOCTOR'
