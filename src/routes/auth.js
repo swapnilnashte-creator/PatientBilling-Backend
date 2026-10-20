@@ -8,6 +8,7 @@ import { pool, withTransaction } from '../db.js';
 import { asyncHandler, badRequest } from '../utils.js';
 import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
 import { mobileSchema } from '../mobile.js';
+import { blockedMessage, currentMaintenance } from '../maintenance.js';
 
 const router = Router();
 
@@ -104,6 +105,9 @@ router.post('/login', loginGuard, asyncHandler(async (req, res) => {
     await pool.query(`INSERT INTO super_admin_audit_logs(superuser_id,action,metadata) VALUES($1,'LOGIN',$2)`, [superuser.id, JSON.stringify({ mobile: superuser.mobile })]);
     return res.json({ token, user: { id: Number(superuser.id), name: superuser.name, mobile: superuser.mobile, email: superuser.email, role: 'SUPER_ADMIN' } });
   }
+  // during planned maintenance only the platform admin can sign in (checked above)
+  const maintenance = await currentMaintenance();
+  if (maintenance.blocking) return res.status(503).json({ message: blockedMessage(maintenance), maintenance });
   const q = await pool.query(
     `SELECT u.id,u.hospital_id,u.name,u.mobile,u.email,u.password_hash,u.role,h.name AS hospital_name
      FROM users u JOIN hospitals h ON h.id=u.hospital_id

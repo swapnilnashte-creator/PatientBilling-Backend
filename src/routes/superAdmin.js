@@ -11,6 +11,7 @@ import { addDays, todayString } from '../billing/pricing.js';
 import billingRoutes from './superAdminBilling.js';
 import { exportHospital, purgeHospital } from '../hospitalPurge.js';
 import { networkReport } from '../proxyCheck.js';
+import { describe, invalidateMaintenance, maintenanceRow } from '../maintenance.js';
 
 const router = Router();
 router.use(allow('SUPER_ADMIN'));
@@ -203,6 +204,45 @@ router.get('/audit', asyncHandler(async (req, res) => {
     [req.user.id]
   );
   res.json(q.rows);
+}));
+
+// ---- Planned maintenance: a notice before it starts, the maintenance page while it runs (see maintenance.js) ----
+const maintenanceState = async () => {
+  const row = await maintenanceRow();
+  const m = describe(row);
+  return { ...m, blockAccess: row ? row.block_access : true, updatedAt: row?.updated_at || null, updatedBy: row?.updated_by_name || null };
+};
+const maintenanceSchema = z.object({
+  startNow: z.boolean().default(false),
+  startsAt: z.string().datetime({ offset: true }).optional(),
+  endsAt: z.string().datetime({ offset: true }),
+  message: z.string().trim().max(400).default(''),
+  blockAccess: z.boolean().default(true),
+});
+router.get('/maintenance', asyncHandler(async (_req, res) => { res.json(await maintenanceState()); }));
+router.put('/maintenance', asyncHandler(async (req, res) => {
+  const body = maintenanceSchema.parse(req.body);
+  const now = new Date();
+  const starts = body.startNow ? now : (body.startsAt ? new Date(body.startsAt) : null);
+  if (!starts) throw badRequest('Choose when the maintenance starts, or use Start now');
+  const ends = new Date(body.endsAt);
+  if (!body.startNow && starts.getTime() < now.getTime() - 2 * 60 * 1000) throw badRequest('The start time has already passed. Choose a later time, or use Start now');
+  if (starts.getTime() > now.getTime() + 60 * 24 * 3600e3) throw badRequest('The start time is more than 60 days away');
+  if (ends <= now) throw badRequest('The end time must be in the future');
+  if (ends <= starts) throw badRequest('The end time must be after the start time');
+  if (ends.getTime() - starts.getTime() > 72 * 3600e3) throw badRequest('Maintenance can last at most 72 hours');
+  await pool.query(
+    `UPDATE platform_maintenance SET starts_at=$1,ends_at=$2,message=$3,block_access=$4,updated_by=$5,updated_at=NOW() WHERE id=1`,
+    [starts, ends, body.message, body.blockAccess, req.user.id]
+  );
+  invalidateMaintenance();
+  res.json(await maintenanceState());
+}));
+// cancel a planned maintenance, or end one that is running
+router.delete('/maintenance', asyncHandler(async (req, res) => {
+  await pool.query(`UPDATE platform_maintenance SET starts_at=NULL,ends_at=NULL,message='',updated_by=$1,updated_at=NOW() WHERE id=1`, [req.user.id]);
+  invalidateMaintenance();
+  res.json(await maintenanceState());
 }));
 
 export default router;
