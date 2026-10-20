@@ -57,45 +57,66 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
     params.push(to); rangeSql += ` AND v.created_at < ($${params.length}::date + INTERVAL '1 day')`;
   }
   let doctorParam = 0;
+  let doctorJoin = '';
   if (isDoctor) {
     params.push(req.user.id); doctorParam = params.length;
-    rangeSql += ` AND EXISTS (SELECT 1 FROM visit_doctors vd WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id AND vd.doctor_id=$${params.length})`;
+    // this doctor's visits are joined once, as a list; a per-visit lookup made a large hospital take about a minute
+    doctorJoin = ` JOIN (SELECT vd.visit_id FROM visit_doctors vd WHERE vd.hospital_id=$1 AND vd.doctor_id=$${doctorParam}) mine ON mine.visit_id=v.id`;
   }
   let searchSql = '';
-  if (term) { params.push(`%${term}%`); searchSql = ` AND (p.full_name ILIKE $${params.length} OR p.mobile ILIKE $${params.length})`; }
+  let searchVisitsSql = '';
+  if (term) {
+    params.push(`%${term}%`);
+    searchSql = ` AND (p.full_name ILIKE $${params.length} OR p.mobile ILIKE $${params.length})`;
+    searchVisitsSql = ` AND v.patient_id IN (SELECT p2.id FROM patients p2 WHERE p2.hospital_id=$1 AND p2.deleted_at IS NULL AND (p2.full_name ILIKE $${params.length} OR p2.mobile ILIKE $${params.length}))`;
+  }
   params.push(limit); const limitParam = params.length;
   params.push(offset); const offsetParam = params.length;
   // with all dates and no doctor filter, patients who never visited are listed too; otherwise only those with a visit in range
   const includeNoVisits = allTime && !isDoctor;
+  // The slow per-patient figures (visit count, amount owed, last finding, follow-up) are worked out only for the patients on the page being shown,
+  // unless the list is sorted or filtered by one of them. Doing them for every patient first made big hospitals take many seconds.
+  const heavyFirst = owes || ['visits', 'owes'].includes(String(req.query.sort || ''));
+  const totalVisitsSql = (a) => `(SELECT COUNT(*)::int FROM visits a WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status<>'CANCELLED') AS total_visits`;
+  const outstandingSql = (a) => `COALESCE((SELECT SUM(vc.amount) FROM visit_charges vc JOIN visits a ON a.id=vc.visit_id AND a.hospital_id=vc.hospital_id
+                        WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)::numeric(12,2) AS outstanding`;
   const q = await pool.query(
-    `SELECT t.*,COUNT(*) OVER()::int AS total FROM (
-       SELECT p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,COALESCE(s.visits,0)::int AS visits,s.last_visit_at,
-              (SELECT COUNT(*)::int FROM visits a WHERE a.hospital_id=p.hospital_id AND a.patient_id=p.id AND a.status<>'CANCELLED') AS total_visits,
-              ${isDoctor ? `(SELECT left(translate(vd.doctor_notes, chr(10) || chr(13) || chr(9), '   '), 120) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
-                WHERE a.hospital_id=p.hospital_id AND a.patient_id=p.id AND vd.doctor_id=$${doctorParam} AND COALESCE(btrim(vd.doctor_notes),'')<>'' ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::text'} AS last_finding,
-              ${isDoctor ? `(SELECT json_build_object('days', vd.follow_up_days, 'visitOn', to_char(a.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD'), 'visitId', a.id) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
-                WHERE a.hospital_id=p.hospital_id AND a.patient_id=p.id AND vd.doctor_id=$${doctorParam} AND vd.follow_up_days IS NOT NULL AND a.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR')
-                  AND NOT EXISTS (SELECT 1 FROM visits b WHERE b.hospital_id=a.hospital_id AND b.patient_id=a.patient_id AND b.id>a.id AND b.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR'))
-                ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::json'} AS follow_up,
-              COALESCE(s.billed,0)::numeric(12,2) AS billed,COALESCE(s.paid,0)::numeric(12,2) AS paid,
-              COALESCE((SELECT SUM(vc.amount) FROM visit_charges vc JOIN visits a ON a.id=vc.visit_id AND a.hospital_id=vc.hospital_id
-                        WHERE a.hospital_id=p.hospital_id AND a.patient_id=p.id AND a.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)::numeric(12,2) AS outstanding
+    `WITH base AS (
+       SELECT p.hospital_id,p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,COALESCE(s.visits,0)::int AS visits,s.last_visit_at,
+              COALESCE(s.billed,0)::numeric(12,2) AS billed,COALESCE(s.paid,0)::numeric(12,2) AS paid${heavyFirst ? `,
+              ${totalVisitsSql('p')},
+              ${outstandingSql('p')}` : ''}
        FROM patients p
-       LEFT JOIN LATERAL (
-         SELECT COUNT(*)::int AS visits,MAX(v.created_at) AS last_visit_at,
+       LEFT JOIN (
+         SELECT v.patient_id,COUNT(*)::int AS visits,MAX(v.created_at) AS last_visit_at,
                 SUM((SELECT COALESCE(SUM(vc.amount),0) FROM visit_charges vc WHERE vc.hospital_id=v.hospital_id AND vc.visit_id=v.id)) AS billed,
                 SUM((SELECT COALESCE(SUM(py.amount),0) FROM payments py WHERE py.hospital_id=v.hospital_id AND py.visit_id=v.id)) AS paid
-         FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id AND v.status<>'CANCELLED'${rangeSql}
-       ) s ON TRUE
+         FROM visits v${doctorJoin}
+         WHERE v.hospital_id=$1 AND v.status<>'CANCELLED'${rangeSql}${searchVisitsSql}
+         GROUP BY v.patient_id
+       ) s ON s.patient_id=p.id
        WHERE p.hospital_id=$1 AND p.deleted_at IS NULL${searchSql}
-     ) t
-     WHERE (t.visits>0${includeNoVisits ? ' OR TRUE' : ''})${owes ? ' AND t.outstanding>0' : ''}
-     ORDER BY ${orderBy},lower(t.full_name),t.id
-     LIMIT $${limitParam} OFFSET $${offsetParam}`,
+     ), page AS (
+       SELECT t.*,COUNT(*) OVER()::int AS total FROM base t
+       WHERE (t.visits>0${includeNoVisits ? ' OR TRUE' : ''})${owes ? ' AND t.outstanding>0' : ''}
+       ORDER BY ${orderBy},lower(t.full_name),t.id
+       LIMIT $${limitParam} OFFSET $${offsetParam}
+     )
+     SELECT t.*${heavyFirst ? '' : `,
+            ${totalVisitsSql('t')},
+            ${outstandingSql('t')}`},
+            ${isDoctor ? `(SELECT left(translate(vd.doctor_notes, chr(10) || chr(13) || chr(9), '   '), 120) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
+              WHERE a.hospital_id=t.hospital_id AND a.patient_id=t.id AND vd.doctor_id=$${doctorParam} AND COALESCE(btrim(vd.doctor_notes),'')<>'' ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::text'} AS last_finding,
+            ${isDoctor ? `(SELECT json_build_object('days', vd.follow_up_days, 'visitOn', to_char(a.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD'), 'visitId', a.id) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
+              WHERE a.hospital_id=t.hospital_id AND a.patient_id=t.id AND vd.doctor_id=$${doctorParam} AND vd.follow_up_days IS NOT NULL AND a.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR')
+                AND NOT EXISTS (SELECT 1 FROM visits b WHERE b.hospital_id=a.hospital_id AND b.patient_id=a.patient_id AND b.id>a.id AND b.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR'))
+              ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::json'} AS follow_up
+     FROM page t
+     ORDER BY ${orderBy},lower(t.full_name),t.id`,
     params
   );
   const todayDay = todayIst();
-  const rows = q.rows.map(({ total, last_finding, follow_up, ...row }) => {
+  const rows = q.rows.map(({ total, hospital_id, last_finding, follow_up, ...row }) => {
     if (!isDoctor) return row;
     let followUp = null;
     if (follow_up && follow_up.days) { const dueOn = addDays(follow_up.visitOn, Number(follow_up.days)); followUp = { dueOn, daysLeft: daysBetween(todayDay, dueOn), days: Number(follow_up.days), visitId: Number(follow_up.visitId) }; }

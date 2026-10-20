@@ -10,8 +10,9 @@ export const pool = new Pool({
     ? { rejectUnauthorized: true }
     : false,
   keepAlive: true,
-  idleTimeoutMillis: 30000,});
-
+  idleTimeoutMillis: 30000,
+  max: Number(process.env.DB_POOL_MAX) || 10,
+});
 // A database connection that drops while idle must not crash the server (the next request just opens a new one)
 pool.on('error', (error) => { console.error('Idle database connection error:', error.message); logError(error, { source: 'idle database connection' }); });
 

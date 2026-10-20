@@ -28,6 +28,7 @@ import bookingPublic from './routes/booking.js';
 import appointmentRoutes from './routes/appointments.js';
 import { auth } from './middleware/auth.js';
 import { proxyWatch, startupProxyNotes, trustProxySetting } from './proxyCheck.js';
+import { currentMaintenance, maintenanceGate } from './maintenance.js';
 
 const app = express();
 // behind a reverse proxy (nginx, Cloudflare) set TRUST_PROXY=1 so each visitor's own address is seen, not the proxy's
@@ -55,6 +56,9 @@ const isPrivateNetworkOrigin = (origin) => {
     return false;
   }
 };
+// What the sign-in page, the app and the stand-alone maintenance page ask: is maintenance planned or in progress? No sign-in and nothing private
+// (only the times and the message the platform admin chose to show), so any page may read it, including maintenance.html opened from a file.
+app.get('/api/public-maintenance', async (_req, res) => { res.set({ 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*' }); res.json(await currentMaintenance()); });
 app.use(cors({
   origin(origin, callback) {
     if (!origin || configuredOrigins.has(origin) || isPrivateNetworkOrigin(origin)) return callback(null, true);
@@ -69,6 +73,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+app.use('/api', maintenanceGate);
 app.use('/api/auth', authRoutes);
 app.use('/api/display-public', displayPublic);
 app.use('/api/public-booking', bookingPublic);
