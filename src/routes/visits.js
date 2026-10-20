@@ -406,11 +406,16 @@ router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
     const target = await client.query(`SELECT doctor_id FROM visits WHERE id=$1 AND hospital_id=$2 AND status='WAITING_FOR_DOCTOR'`, [req.params.id, req.user.hospitalId]);
     if (target.rowCount) {
       const open = await client.query(
-        `SELECT v.id,p.full_name FROM visits v JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
+        `SELECT v.id,v.created_at,v.daily_number,p.full_name FROM visits v JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
          WHERE v.hospital_id=$1 AND v.doctor_id=$2 AND v.status='WITH_DOCTOR' AND v.id<>$3 ORDER BY v.updated_at LIMIT 1`,
         [req.user.hospitalId, target.rows[0].doctor_id, req.params.id]
       );
-      if (open.rowCount) throw badRequest(`Complete the visit of ${open.rows[0].full_name} first. A new visit can be started only after the one in progress is completed or sent to reception.`);
+      if (open.rowCount) {
+        const o = open.rows[0];
+        // the day the visit was registered (India time), so a visit left open from an earlier day is easy to recognise
+        const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+        throw badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`);
+      }
     }
     const q = await client.query(
       `UPDATE visits SET status='WITH_DOCTOR',updated_at=NOW()
