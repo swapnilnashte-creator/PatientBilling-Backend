@@ -41,6 +41,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
      JOIN users u ON u.hospital_id=vd.hospital_id AND u.id=vd.doctor_id
      JOIN patients p ON p.hospital_id=v.hospital_id AND p.id=v.patient_id AND p.deleted_at IS NULL
      WHERE v.hospital_id=$1 AND v.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR')${doctorSql}
+       AND v.created_at > NOW() - INTERVAL '546 days' -- a follow-up is at most 365 days after the visit and is dropped 180 days after it is due, so older visits can never be listed (keeps this fast as years pass)
        AND NOT EXISTS (SELECT 1 FROM visits v2 WHERE v2.hospital_id=v.hospital_id AND v2.patient_id=v.patient_id AND v2.id>v.id AND v2.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR'))
      GROUP BY v.id,p.id`, params);
   const totals = { overdue: 0, week: 0, soon: 0 };

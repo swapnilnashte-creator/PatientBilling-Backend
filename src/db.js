@@ -9,6 +9,7 @@ export const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
   keepAlive: true,
   idleTimeoutMillis: 30000,
+  max: Number(process.env.DB_POOL_MAX) || 10, // connections this process may use at once; raise it (and run more processes) as clinics grow
 });
 
 // A database connection that drops while idle must not crash the server (the next request just opens a new one)

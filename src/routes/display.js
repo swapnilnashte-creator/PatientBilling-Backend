@@ -56,11 +56,21 @@ displayAdmin.delete('/', allow('ADMIN'), asyncHandler(async (req, res) => {
 
 // ---- for the TV: no sign-in, only the link. It returns tokens, doctor names and nothing else. ----
 export const displayPublic = Router();
+// The logo is fetched once, from its own address, and the browser keeps it. Sending it with every 5-second poll made each TV pull tens of KB again and again.
+displayPublic.get('/:token/logo', asyncHandler(async (req, res) => {
+  const token = String(req.params.token || '');
+  if (token.length < 20 || token.length > 64) throw notFound('This display link is not valid');
+  const h = await pool.query('SELECT logo_data,logo_mime FROM hospitals WHERE display_token=$1 AND is_active=TRUE AND logo_data IS NOT NULL', [token]);
+  if (!h.rowCount) throw notFound('No logo');
+  res.set({ 'Content-Type': h.rows[0].logo_mime || 'image/png', 'Cache-Control': 'private, max-age=86400', 'X-Robots-Tag': 'noindex, nofollow', 'X-Content-Type-Options': 'nosniff', 'Cross-Origin-Resource-Policy': 'cross-origin' });
+  res.send(h.rows[0].logo_data);
+}));
+
 displayPublic.get('/:token', asyncHandler(async (req, res) => {
   res.set({ 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' });
   const token = String(req.params.token || '');
   if (token.length < 20 || token.length > 64) throw notFound('This display link is not valid');
-  const h = await pool.query('SELECT id,name,logo_data,logo_mime,display_voice,display_chime FROM hospitals WHERE display_token=$1 AND is_active=TRUE', [token]);
+  const h = await pool.query('SELECT id,name,(logo_data IS NOT NULL) AS has_logo,logo_updated_at,display_voice,display_chime FROM hospitals WHERE display_token=$1 AND is_active=TRUE', [token]);
   if (!h.rowCount) throw notFound('This display link is not valid');
   const hospital = h.rows[0];
   const doctors = await pool.query(`SELECT id,name FROM users WHERE hospital_id=$1 AND role='DOCTOR' AND is_active=TRUE ORDER BY name`, [hospital.id]);
@@ -84,7 +94,7 @@ displayPublic.get('/:token', asyncHandler(async (req, res) => {
   }
   res.json({
     sound: { voice: hospital.display_voice, chime: hospital.display_chime },
-    hospital: { name: hospital.name, logo: hospital.logo_data ? `data:${hospital.logo_mime};base64,${hospital.logo_data.toString('base64')}` : null },
+    hospital: { name: hospital.name, logoVersion: hospital.has_logo ? Number(new Date(hospital.logo_updated_at || 0)) || 1 : null },
     now: new Date().toISOString(),
     doctors: doctors.rows.map(d => {
       const mine = by.get(String(d.id)) || [];
