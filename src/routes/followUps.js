@@ -32,7 +32,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
   let doctorSql = '';
   if (req.user.role === 'DOCTOR') { params.push(req.user.id); doctorSql = ` AND vd.doctor_id=$2`; }
   const q = await pool.query(
-    `SELECT v.id AS visit_id,v.patient_id,p.full_name,p.mobile,to_char(p.date_of_birth,'YYYY-MM-DD') AS dob,p.dob_estimated,
+    `SELECT v.id AS visit_id,v.patient_id,p.full_name,p.mobile,COALESCE(p.whatsapp_mobile,p.mobile) AS whatsapp,to_char(p.date_of_birth,'YYYY-MM-DD') AS dob,p.dob_estimated,
             to_char(v.created_at AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS visit_on,
             MIN(vd.follow_up_days) AS follow_up_days,
             (ARRAY_AGG(u.name ORDER BY vd.follow_up_days,vd.position))[1] AS doctor_name
@@ -51,7 +51,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
     const daysLeft = daysBetween(today, dueOn);
     if (daysLeft < -LAPSED_AFTER_DAYS || daysLeft > days) continue;
     if (daysLeft < 0) totals.overdue += 1; else if (daysLeft <= 7) totals.week += 1; else totals.soon += 1;
-    rows.push({ visitId: Number(r.visit_id), patientId: Number(r.patient_id), name: r.full_name, mobile: r.mobile, dob: r.dob, dobEstimated: r.dob_estimated,
+    rows.push({ visitId: Number(r.visit_id), patientId: Number(r.patient_id), name: r.full_name, mobile: r.mobile, whatsapp: r.whatsapp, dob: r.dob, dobEstimated: r.dob_estimated,
       visitOn: r.visit_on, followUpDays: Number(r.follow_up_days), doctor: r.doctor_name, dueOn, daysLeft, status: daysLeft < 0 ? 'OVERDUE' : daysLeft <= 7 ? 'DUE_SOON' : 'UPCOMING' });
   }
   rows.sort((a, b) => a.daysLeft - b.daysLeft || a.name.localeCompare(b.name));

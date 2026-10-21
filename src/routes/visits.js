@@ -8,7 +8,7 @@ const router = Router();
 
 async function getVisit(client, hospitalId, visitId, lock = false) {
   const q = await client.query(
-    `SELECT v.*, p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,p.qr_code AS patient_qr_code,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,
+    `SELECT v.*, p.full_name,p.mobile,p.whatsapp_mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,p.qr_code AS patient_qr_code,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,
             d.name AS doctor_name,d.qualification AS doctor_qualification,d.registration_no AS doctor_registration_no
      FROM visits v
      JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
@@ -294,7 +294,7 @@ router.get('/', asyncHandler(async (req, res) => {
   }
   const q = await pool.query(
     `SELECT v.id,v.visit_number,v.daily_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
-            p.id AS patient_id,p.full_name,p.mobile,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,d.name AS doctor_name,
+            p.id AS patient_id,p.full_name,p.mobile,p.whatsapp_mobile,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,d.name AS doctor_name,
             (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status,'started_at',vd.started_at,'completed_at',vd.completed_at) ORDER BY vd.position)
              FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
              WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id) AS doctors,

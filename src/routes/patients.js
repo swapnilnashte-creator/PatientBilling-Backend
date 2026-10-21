@@ -11,6 +11,8 @@ const router = Router();
 const patientSchema = z.object({
   fullName: z.string().min(2).max(160),
   mobile: mobileSchema,
+  // WhatsApp number when it differs from the mobile number; empty or the same number means "same as the mobile"
+  whatsappMobile: z.union([mobileSchema, z.literal(''), z.null()]).optional(),
   gender: z.enum(['MALE','FEMALE','OTHER','PREFER_NOT_TO_SAY']).nullable().optional(),
   dateOfBirth: z.string().date().nullable().optional(),
   age: z.number().int().min(0).max(365).nullable().optional(),
@@ -21,6 +23,9 @@ const patientSchema = z.object({
   .refine(d => d.dateOfBirth || (d.age !== null && d.age !== undefined), { message: 'Age or date of birth is required', path: ['age'] })
   .refine(d => d.age === null || d.age === undefined || d.age <= ({ YEARS: 120, MONTHS: 59, DAYS: 365 })[d.ageUnit || 'YEARS'], { message: 'Age is too high for the chosen unit', path: ['age'] })
   .refine(d => !d.dateOfBirth || d.dateOfBirth <= new Date(Date.now() + 864e5).toISOString().slice(0, 10), { message: 'Date of birth cannot be in the future', path: ['dateOfBirth'] });
+
+// the WhatsApp number to store: nothing when it is empty or the same as the mobile number (then WhatsApp simply follows the mobile)
+const whatsappToStore = (data) => (data.whatsappMobile && data.whatsappMobile !== data.mobile ? data.whatsappMobile : null);
 
 // date_of_birth = the given date, or today minus the age when only an age was given
 const dobSql = (dobParam, ageParam, unitParam) => `COALESCE($${dobParam}::date,(CURRENT_DATE-($${ageParam}::int*CASE $${unitParam}::text WHEN 'MONTHS' THEN INTERVAL '1 month' WHEN 'DAYS' THEN INTERVAL '1 day' ELSE INTERVAL '1 year' END))::date)`;
@@ -82,7 +87,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
                         WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)::numeric(12,2) AS outstanding`;
   const q = await pool.query(
     `WITH base AS (
-       SELECT p.hospital_id,p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,COALESCE(s.visits,0)::int AS visits,s.last_visit_at,
+       SELECT p.hospital_id,p.id,p.full_name,p.mobile,p.whatsapp_mobile,p.gender,p.date_of_birth,p.dob_estimated,COALESCE(s.visits,0)::int AS visits,s.last_visit_at,
               COALESCE(s.billed,0)::numeric(12,2) AS billed,COALESCE(s.paid,0)::numeric(12,2) AS paid${heavyFirst ? `,
               ${totalVisitsSql('p')},
               ${outstandingSql('p')}` : ''}
@@ -129,7 +134,7 @@ router.get('/search', asyncHandler(async (req, res) => {
   const term = String(req.query.q || '').trim();
   if (!term) return res.json([]);
   const q = await pool.query(
-    `SELECT p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
+    `SELECT p.id,p.full_name,p.mobile,p.whatsapp_mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
             (SELECT COUNT(*)::int FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS visit_count,
             (SELECT MAX(v.created_at) FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS last_visit_at
      FROM patients p
@@ -146,7 +151,7 @@ router.get('/by-code/:code', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandle
   const code = String(req.params.code || '').trim().toLowerCase();
   if (!/^[a-f0-9]{16}$/.test(code)) throw notFound('Patient not found');
   const q = await pool.query(
-    `SELECT p.id,p.full_name,p.mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
+    `SELECT p.id,p.full_name,p.mobile,p.whatsapp_mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,
             (SELECT COUNT(*)::int FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS visit_count,
             (SELECT MAX(v.created_at) FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id) AS last_visit_at,
             (SELECT v.status FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id AND v.status IN ('WAITING_FOR_DOCTOR','WITH_DOCTOR','PAYMENT_PENDING') ORDER BY v.id DESC LIMIT 1) AS open_visit_status
@@ -180,10 +185,10 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
   const data = patientSchema.parse(req.body);
   await assertNotDuplicate(req.user.hospitalId, data.mobile, data.fullName);
   const q = await pool.query(
-    `INSERT INTO patients(hospital_id,full_name,mobile,gender,date_of_birth,dob_estimated,address,created_by,updated_by)
-     VALUES($1,$2,$3,$4,${dobSql(5, 6, 9)},$5::date IS NULL,$7,$8,$8)
-     RETURNING id,full_name,mobile,gender,date_of_birth,dob_estimated,address`,
-    [req.user.hospitalId, data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, data.ageUnit || 'YEARS']
+    `INSERT INTO patients(hospital_id,full_name,mobile,gender,date_of_birth,dob_estimated,address,created_by,updated_by,whatsapp_mobile)
+     VALUES($1,$2,$3,$4,${dobSql(5, 6, 9)},$5::date IS NULL,$7,$8,$8,$10)
+     RETURNING id,full_name,mobile,whatsapp_mobile,gender,date_of_birth,dob_estimated,address`,
+    [req.user.hospitalId, data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, data.ageUnit || 'YEARS', whatsappToStore(data)]
   );
   res.status(201).json(q.rows[0]);
 }));
@@ -192,10 +197,10 @@ router.put('/:id', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (r
   const data = patientSchema.parse(req.body);
   await assertNotDuplicate(req.user.hospitalId, data.mobile, data.fullName, req.params.id);
   const q = await pool.query(
-    `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=${dobSql(4, 5, 10)},dob_estimated=$4::date IS NULL,address=$6,updated_by=$7,updated_at=NOW()
+    `UPDATE patients SET full_name=$1,mobile=$2,gender=$3,date_of_birth=${dobSql(4, 5, 10)},dob_estimated=$4::date IS NULL,address=$6,updated_by=$7,whatsapp_mobile=$11,updated_at=NOW()
      WHERE id=$8 AND hospital_id=$9 AND deleted_at IS NULL
-     RETURNING id,full_name,mobile,gender,date_of_birth,dob_estimated,address`,
-    [data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, req.params.id, req.user.hospitalId, data.ageUnit || 'YEARS']
+     RETURNING id,full_name,mobile,whatsapp_mobile,gender,date_of_birth,dob_estimated,address`,
+    [data.fullName, data.mobile, data.gender || null, data.dateOfBirth || null, data.age ?? null, data.address || null, req.user.id, req.params.id, req.user.hospitalId, data.ageUnit || 'YEARS', whatsappToStore(data)]
   );
   if (!q.rowCount) throw notFound('Patient not found');
   res.json(q.rows[0]);
@@ -211,7 +216,7 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
   const money = role !== 'DOCTOR';
   const id = z.coerce.number().int().positive().parse(req.params.id);
   const patientQ = await pool.query(
-    `SELECT id,full_name,mobile,gender,to_char(date_of_birth,'YYYY-MM-DD') AS date_of_birth,dob_estimated,address,created_at FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL`,
+    `SELECT id,full_name,mobile,whatsapp_mobile,gender,to_char(date_of_birth,'YYYY-MM-DD') AS date_of_birth,dob_estimated,address,created_at FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL`,
     [id, hospitalId]
   );
   if (!patientQ.rowCount) throw notFound('Patient not found');
