@@ -65,6 +65,28 @@ router.get('/search', asyncHandler(async (req, res) => {
   res.json({ items: [...customItems, ...items].slice(0, limit), prefixTotal: total.rows[0].n });
 }));
 
+// Suggestions for the "Content" of a custom medicine: the distinct compositions in our medicine table that match what the doctor typed,
+// for example "para caf" finds "Paracetamol (500mg) + Caffeine (30mg)". Every word must match; compositions that start with the first word come first,
+// then the ones used by the most medicines. Discontinued medicines are left out.
+router.get('/compositions', asyncHandler(async (req, res) => {
+  const text = String(req.query.q || '').trim().toLowerCase().slice(0, 80);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 8, 1), 15);
+  const words = text.split(/[\s+,/]+/).filter(w => w.length >= 2).slice(0, 4);
+  if (!words.length) return res.json({ items: [] });
+  const params = words.map(w => `%${likeEscape(w)}%`);
+  const where = params.map((_, i) => `lower(short_composition1 || ' ' || short_composition2) LIKE $${i + 1}`).join(' AND ');
+  params.push(`${likeEscape(words[0])}%`, limit);
+  const q = await pool.query(
+    `SELECT comp,COUNT(*)::int AS uses FROM (
+       SELECT regexp_replace(concat_ws(' + ',NULLIF(btrim(short_composition1),''),NULLIF(btrim(short_composition2),'')),'[[:space:]]+',' ','g') AS comp -- one space only, so "Amoxycillin  (500mg)" and "Amoxycillin (500mg)" are one suggestion
+       FROM medicines WHERE NOT is_discontinued AND ${where}
+     ) x WHERE comp<>'' GROUP BY comp
+     ORDER BY (lower(comp) LIKE $${words.length + 1}) DESC,uses DESC,length(comp),comp LIMIT $${words.length + 2}`,
+    params
+  );
+  res.json({ items: q.rows.map(r => ({ composition: r.comp, uses: r.uses })) });
+}));
+
 // The doctor's own most-used medicines (the admin sees the hospital's), with the dose / timing / duration they used last time.
 router.get('/frequent', allow('ADMIN','DOCTOR'), asyncHandler(async (req, res) => {
   const q = await pool.query(

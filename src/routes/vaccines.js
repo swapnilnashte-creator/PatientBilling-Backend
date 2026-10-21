@@ -351,7 +351,7 @@ router.get('/due', asyncHandler(async (req, res) => {
   let doctorSql = '';
   if (req.user.role === 'DOCTOR') { params.push(req.user.id); doctorSql = ` AND EXISTS (SELECT 1 FROM visit_doctors vd WHERE vd.hospital_id=p.hospital_id AND vd.doctor_id=$3 AND vd.visit_id IN (SELECT v.id FROM visits v WHERE v.hospital_id=p.hospital_id AND v.patient_id=p.id))`; }
   const people = await pool.query(
-    `SELECT p.id,p.full_name,p.mobile,to_char(p.date_of_birth,'YYYY-MM-DD') AS dob,p.dob_estimated FROM patients p
+    `SELECT p.id,p.full_name,p.mobile,COALESCE(p.whatsapp_mobile,p.mobile) AS whatsapp,to_char(p.date_of_birth,'YYYY-MM-DD') AS dob,p.dob_estimated FROM patients p
      WHERE p.hospital_id=$1 AND p.deleted_at IS NULL AND p.date_of_birth IS NOT NULL AND p.date_of_birth >= $2::date${doctorSql}`, params);
   const [catalogue, recs] = await Promise.all([loadCatalogue(pool, hospitalId, { activeOnly: true }), recordsOf(pool, hospitalId, people.rows.map(p => Number(p.id)))]);
   const rows = [];
@@ -362,7 +362,7 @@ router.get('/due', asyncHandler(async (req, res) => {
     if (!due.length) continue;
     const worst = Math.min(...due.map(i => i.daysLeft));
     if (worst < 0) totals.overdue += 1; else if (worst <= 7) totals.week += 1; else totals.soon += 1;
-    rows.push({ patientId: Number(p.id), name: p.full_name, mobile: p.mobile, dob: p.dob, dobEstimated: p.dob_estimated, worst,
+    rows.push({ patientId: Number(p.id), name: p.full_name, mobile: p.mobile, whatsapp: p.whatsapp, dob: p.dob, dobEstimated: p.dob_estimated, worst,
       doses: due.sort((a, b) => a.daysLeft - b.daysLeft).map(i => ({ vaccineId: i.vaccineId, name: i.name, label: i.label, doseNo: i.doseNo, status: i.status, dueOn: i.dueOn, daysLeft: i.daysLeft })) });
   }
   rows.sort((a, b) => a.worst - b.worst || a.name.localeCompare(b.name));
