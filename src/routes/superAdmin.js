@@ -12,6 +12,7 @@ import billingRoutes from './superAdminBilling.js';
 import { exportHospital, purgeHospital } from '../hospitalPurge.js';
 import { networkReport } from '../proxyCheck.js';
 import { describe, invalidateMaintenance, maintenanceRow } from '../maintenance.js';
+import { MAX_ATTEMPTS, closeStale, hashCode, openSession, sameHash } from '../supportAccess.js';
 
 const router = Router();
 router.use(allow('SUPER_ADMIN'));
@@ -154,10 +155,20 @@ async function startImpersonation(req, res, hospitalId, userId) {
   if (!targetQ.rowCount) throw badRequest(userId ? 'User is inactive or does not belong to this hospital' : 'Hospital has no active Admin account');
   const hospital = hospitalQ.rows[0];
   const target = targetQ.rows[0];
+  // The hospital must have given a code first (Hospital Settings > Support access). Without an open session nobody signs in to a hospital.
+  const session = await openSession(pool, hospital.id);
+  if (!session || Number(session.superuser_id) !== Number(req.user.id)) {
+    throw Object.assign(new Error('The hospital has not given support access. Ask its Admin to create a support code in Hospital Settings, then enter it here.'), { status: 403, needCode: true });
+  }
+  const seconds = Math.max(60, Math.min(2 * 3600, Math.floor((new Date(session.session_ends_at) - Date.now()) / 1000)));
   const token = jwt.sign(
     { hospitalId: target.hospital_id, role: target.role, name: target.name, impersonatedBySuperuserId: req.user.id },
     process.env.JWT_SECRET,
-    { subject: String(target.id), expiresIn: '2h' }
+    { subject: String(target.id), expiresIn: seconds }
+  );
+  await pool.query(
+    `INSERT INTO support_access_events(support_id,hospital_id,action,target_user_id,target_name,target_role) VALUES($1,$2,'SIGN_IN_AS',$3,$4,$5)`,
+    [session.id, hospital.id, target.id, target.name, target.role]
   );
   await pool.query(
     `INSERT INTO super_admin_audit_logs(superuser_id,action,hospital_id,target_user_id,metadata)
@@ -173,6 +184,35 @@ async function startImpersonation(req, res, hospitalId, userId) {
     },
   });
 }
+
+// Type in the code the hospital's Admin read out. Right: a support session opens for the time the hospital chose. Wrong: a try is used up; after 5 the code is cancelled.
+router.post('/hospitals/:id/support/verify', asyncHandler(async (req, res) => {
+  const hospitalId = z.coerce.number().int().positive().parse(req.params.id);
+  const { code } = z.object({ code: z.string().trim().regex(/^\d{6}$/, 'The code has 6 digits') }).parse(req.body);
+  const outcome = await withTransaction(async (client) => {
+    await closeStale(client, hospitalId);
+    const q = await client.query(`SELECT id,code_hash,attempts,session_minutes FROM support_access WHERE hospital_id=$1 AND status='CODE' FOR UPDATE`, [hospitalId]);
+    if (!q.rowCount) return { none: true };
+    const row = q.rows[0];
+    if (!sameHash(hashCode(code, hospitalId), row.code_hash)) {
+      const attempts = row.attempts + 1;
+      const locked = attempts >= MAX_ATTEMPTS;
+      await client.query(
+        `UPDATE support_access SET attempts=$2,status=CASE WHEN $3::boolean THEN 'CANCELLED' ELSE status END,ended_at=CASE WHEN $3::boolean THEN NOW() END,ended_reason=CASE WHEN $3::boolean THEN 'TOO_MANY_TRIES' END WHERE id=$1`,
+        [row.id, attempts, locked]);
+      await client.query(`INSERT INTO support_access_events(support_id,hospital_id,action) VALUES($1,$2,'CODE_WRONG')`, [row.id, hospitalId]);
+      return { wrong: true, attemptsLeft: Math.max(0, MAX_ATTEMPTS - attempts), locked };
+    }
+    const done = await client.query(
+      `UPDATE support_access SET status='SESSION',superuser_id=$2,session_started_at=NOW(),session_ends_at=NOW()+make_interval(mins=>session_minutes) WHERE id=$1 RETURNING session_ends_at`,
+      [row.id, req.user.id]);
+    await client.query(`INSERT INTO support_access_events(support_id,hospital_id,action) VALUES($1,$2,'CODE_OK')`, [row.id, hospitalId]);
+    return { ok: true, endsAt: done.rows[0].session_ends_at };
+  });
+  if (outcome.none) throw Object.assign(new Error('This hospital has no valid support code. Ask its Admin to create one in Hospital Settings > Support access.'), { status: 400, needCode: true });
+  if (outcome.wrong) throw Object.assign(new Error(outcome.locked ? 'That code is not correct and the code is now cancelled. Ask the hospital Admin for a new one.' : `That code is not correct. ${outcome.attemptsLeft} ${outcome.attemptsLeft === 1 ? 'try' : 'tries'} left.`), { status: 400, attemptsLeft: outcome.attemptsLeft });
+  res.json({ endsAt: outcome.endsAt });
+}));
 
 router.get('/hospitals/:id/users', asyncHandler(async (req, res) => {
   const hospitalId = z.coerce.number().int().positive().parse(req.params.id);

@@ -26,6 +26,7 @@ import subscriptionRoutes from './routes/subscription.js';
 import superAdminRoutes from './routes/superAdmin.js';
 import bookingPublic from './routes/booking.js';
 import appointmentRoutes from './routes/appointments.js';
+import supportAccessRoutes from './routes/supportAccess.js';
 import { auth } from './middleware/auth.js';
 import { proxyWatch, startupProxyNotes, trustProxySetting } from './proxyCheck.js';
 import { currentMaintenance, maintenanceGate } from './maintenance.js';
@@ -80,6 +81,7 @@ app.use('/api/follow-ups', auth, followUpRoutes);
 app.use('/api/reminders', auth, reminderRoutes);
 app.use('/api/allergies', auth, allergyRoutes);
 app.use('/api/appointments', auth, appointmentRoutes);
+app.use('/api/support-access', auth, supportAccessRoutes);
 app.use('/api/display-link', auth, displayAdmin);
 app.use('/api/billing-items', auth, billingItemRoutes);
 app.use('/api/visits', auth, visitRoutes);
@@ -100,7 +102,7 @@ app.use((err, req, res, _next) => {
   const status = err.status || 500;
   // expected problems (wrong password, not found, not allowed) carry their own message; anything unexpected is written to the
   // daily error log and the person sees a short reference to quote instead of internal details
-  if (status < 500) return res.status(status).json({ message: err.message || 'Request failed', ...(err.needDetails ? { needDetails: true } : {}), ...(err.duplicate ? { duplicate: true } : {}), ...(err.openVisit ? { openVisit: err.openVisit } : {}) });
+  if (status < 500) return res.status(status).json({ message: err.message || 'Request failed', ...(err.needDetails ? { needDetails: true } : {}), ...(err.duplicate ? { duplicate: true } : {}), ...(err.openVisit ? { openVisit: err.openVisit } : {}), ...(err.needCode ? { needCode: true } : {}), ...(err.attemptsLeft !== undefined ? { attemptsLeft: err.attemptsLeft } : {}) });
   console.error(err);
   const ref = logError(err, { method: req.method, url: req.originalUrl, status, user: req.user ? `${req.user.role} ${req.user.id}${req.user.hospitalId ? ` (hospital ${req.user.hospitalId})` : ''}` : '' });
   res.status(status).json({ message: `Something went wrong on our side. Please try again. If it keeps happening, tell support this reference: ${ref}`, ref });
