@@ -1,4 +1,4 @@
-﻿import { logError } from './errorLog.js';
+import { logError } from './errorLog.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -26,6 +26,7 @@ import subscriptionRoutes from './routes/subscription.js';
 import superAdminRoutes from './routes/superAdmin.js';
 import bookingPublic from './routes/booking.js';
 import appointmentRoutes from './routes/appointments.js';
+import supportAccessRoutes from './routes/supportAccess.js';
 import { auth } from './middleware/auth.js';
 import { proxyWatch, startupProxyNotes, trustProxySetting } from './proxyCheck.js';
 import { currentMaintenance, maintenanceGate } from './maintenance.js';
@@ -84,6 +85,7 @@ app.use('/api/follow-ups', auth, followUpRoutes);
 app.use('/api/reminders', auth, reminderRoutes);
 app.use('/api/allergies', auth, allergyRoutes);
 app.use('/api/appointments', auth, appointmentRoutes);
+app.use('/api/support-access', auth, supportAccessRoutes);
 app.use('/api/display-link', auth, displayAdmin);
 app.use('/api/billing-items', auth, billingItemRoutes);
 app.use('/api/visits', auth, visitRoutes);
@@ -127,6 +129,8 @@ app.use((err, req, res, _next) => {
       ...(err.needDetails ? { needDetails: true } : {}),
       ...(err.duplicate ? { duplicate: true } : {}),
       ...(err.openVisit ? { openVisit: err.openVisit } : {}),
+      ...(err.needCode ? { needCode: true } : {}),
+      ...(err.attemptsLeft !== undefined ? { attemptsLeft: err.attemptsLeft } : {}),
     });
   }
 

@@ -371,7 +371,7 @@ router.post('/h/:slug/manage/reschedule', asyncHandler(async (req, res) => {
     try {
       // the booking number stays the same; the staff see that it was moved, and an old WhatsApp message no longer matches
       await client.query(
-        `UPDATE appointments SET slot_at=$3,slot_day=$4,previous_slot_at=slot_at,reschedule_count=reschedule_count+1,whatsapp_sent_at=NULL,whatsapp_sent_by=NULL WHERE hospital_id=$1 AND id=$2`,
+        `UPDATE appointments SET slot_at=$3,slot_day=$4,previous_slot_at=slot_at,reschedule_count=reschedule_count+1,whatsapp_sent_at=NULL,whatsapp_sent_by=NULL,called_at=NULL,called_by=NULL WHERE hospital_id=$1 AND id=$2`,
         [hospital.id, own.id, slotAt, day]);
     } catch (err) {
       if (err.code === '23505') throw Object.assign(new Error('You already have another appointment with this doctor on that day. Please choose another day.'), { status: 409 });

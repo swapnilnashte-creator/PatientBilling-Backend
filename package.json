@@ -14,7 +14,8 @@
     "smoke:patient-age": "node test/smoke-patient-age.mjs",
     "smoke:expenses": "node test/smoke-expenses.mjs",
     "smoke:prescription": "node test/smoke-prescription.mjs",
-    "smoke:multi-firm-login": "node test/smoke-multi-firm-login.js"
+    "smoke:multi-firm-login": "node test/smoke-multi-firm-login.js",
+    "backfill-prescription-audit": "node database-scripts/backfill-prescription-audit.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

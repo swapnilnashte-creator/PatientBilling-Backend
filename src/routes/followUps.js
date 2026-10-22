@@ -7,7 +7,7 @@ import { sentMap } from './reminders.js';
 import { addDays, daysBetween, todayIst } from '../vaccination.js';
 
 const router = Router();
-export const DEFAULT_FOLLOW_UP_MESSAGE = 'Hello, this is {hospital}. {patient}, {doctor} advised a follow-up visit {when}. Please call us to book a time.';
+export const DEFAULT_FOLLOW_UP_MESSAGE = "Hello {patient},\n\nGreetings from {hospital}.\n\nThis is a friendly reminder that your follow-up visit with {doctor} is due around {when}.\n\nPlease contact us at {hospitalPhone} to schedule your appointment.\n\nThank you,\n{hospital}";
 const readMessage = async (hospitalId) => {
   const q = await pool.query('SELECT follow_up_reminder_message FROM hospitals WHERE id=$1', [hospitalId]);
   return { reminderMessage: q.rows[0]?.follow_up_reminder_message || null, defaultReminderMessage: DEFAULT_FOLLOW_UP_MESSAGE };
@@ -56,7 +56,8 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
   }
   rows.sort((a, b) => a.daysLeft - b.daysLeft || a.name.localeCompare(b.name));
   const sent = await sentMap(pool, hospitalId, 'FOLLOW_UP', rows.map(r => r.patientId));
-  for (const r of rows) r.reminder = sent.get(`${r.patientId}:${r.visitId}`) || null;
+  const called = await sentMap(pool, hospitalId, 'FOLLOW_UP_CALL', rows.map(r => r.patientId));
+  for (const r of rows) { r.reminder = sent.get(`${r.patientId}:${r.visitId}`) || null; r.call = called.get(`${r.patientId}:${r.visitId}`) || null; }
   res.json({ days, totals, total: rows.length, rows: rows.slice(0, 500), ...(await readMessage(hospitalId)) });
 }));
 

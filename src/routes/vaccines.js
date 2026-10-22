@@ -4,7 +4,7 @@ import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, forbidden, notFound } from '../utils.js';
 import { sentMap } from './reminders.js';
-import { DEFAULT_REMINDER_MESSAGE, STARTER_VACCINES, addDays, daysBetween, todayIst, workOutSchedule } from '../vaccination.js';
+import { DEFAULT_REMINDER_MESSAGE, REMOVED_REMINDER_FIELDS, STARTER_VACCINES, addDays, daysBetween, todayIst, workOutSchedule } from '../vaccination.js';
 
 const router = Router();
 const OPEN_FOR_STAFF = ['WAITING_FOR_DOCTOR', 'WITH_DOCTOR', 'PAYMENT_PENDING'];
@@ -15,7 +15,7 @@ async function readSettings(db, hospitalId) {
      FROM hospitals h LEFT JOIN users u ON u.id=h.vaccine_schedule_approved_by AND u.hospital_id=h.id WHERE h.id=$1`, [hospitalId]);
   const r = q.rows[0];
   const approved = Boolean(r.vaccine_schedule_approved_at) && (!r.vaccine_schedule_changed_at || r.vaccine_schedule_approved_at >= r.vaccine_schedule_changed_at);
-  return { enabled: r.vaccination_enabled, approved, approvedAt: r.vaccine_schedule_approved_at, approvedBy: r.approved_by_name || null, changedAt: r.vaccine_schedule_changed_at, reminderMessage: r.vaccine_reminder_message || null, defaultReminderMessage: DEFAULT_REMINDER_MESSAGE };
+  return { enabled: r.vaccination_enabled, approved, approvedAt: r.vaccine_schedule_approved_at, approvedBy: r.approved_by_name || null, changedAt: r.vaccine_schedule_changed_at, reminderMessage: r.vaccine_reminder_message && !REMOVED_REMINDER_FIELDS.test(r.vaccine_reminder_message) ? r.vaccine_reminder_message : null, defaultReminderMessage: DEFAULT_REMINDER_MESSAGE };
 }
 const markChanged = (db, hospitalId) => db.query(`UPDATE hospitals SET vaccine_schedule_changed_at=NOW() WHERE id=$1`, [hospitalId]);
 
@@ -72,6 +72,7 @@ router.put('/enable', allow('ADMIN'), asyncHandler(async (req, res) => {
 // The wording of the WhatsApp reminder. An empty message goes back to the standard wording.
 router.put('/reminder-message', allow('ADMIN'), asyncHandler(async (req, res) => {
   const { message } = z.object({ message: z.string().trim().max(600) }).parse(req.body);
+  if (REMOVED_REMINDER_FIELDS.test(message)) throw badRequest('The message cannot include vaccine names or doses. Use fields such as the patient name, hospital name, due date and status.');
   await pool.query(`UPDATE hospitals SET vaccine_reminder_message=$2 WHERE id=$1`, [req.user.hospitalId, message || null]);
   res.json(await readSettings(pool, req.user.hospitalId));
 }));
@@ -368,7 +369,8 @@ router.get('/due', asyncHandler(async (req, res) => {
   rows.sort((a, b) => a.worst - b.worst || a.name.localeCompare(b.name));
   // a reminder counts as sent for the earliest due date; a newly due dose is a new reminder
   const sent = await sentMap(pool, hospitalId, 'VACCINE', rows.map(r => r.patientId));
-  for (const r of rows) { r.reminderRef = r.doses[0].dueOn; r.reminder = sent.get(`${r.patientId}:${r.reminderRef}`) || null; }
+  const called = await sentMap(pool, hospitalId, 'VACCINE_CALL', rows.map(r => r.patientId));
+  for (const r of rows) { r.reminderRef = r.doses[0].dueOn; r.reminder = sent.get(`${r.patientId}:${r.reminderRef}`) || null; r.call = called.get(`${r.patientId}:${r.reminderRef}`) || null; }
   res.json({ ...settings, days, totals, total: rows.length, rows: rows.slice(0, 500) });
 }));
 

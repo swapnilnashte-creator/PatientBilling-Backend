@@ -7,8 +7,11 @@ const ms = (iso) => Date.UTC(Number(iso.slice(0, 4)), Number(iso.slice(5, 7)) - 
 export const addDays = (iso, days) => new Date(ms(iso) + days * DAY).toISOString().slice(0, 10);
 export const daysBetween = (fromIso, toIso) => Math.round((ms(toIso) - ms(fromIso)) / DAY);
 
-// The standard WhatsApp reminder. {patient} {hospital} {vaccine} {dose} {status} {when} {vaccines} are filled in for each patient.
-export const DEFAULT_REMINDER_MESSAGE = "Hello, this is {hospital}. {patient}'s vaccine is {status}: {vaccine} ({dose}), {when}. Please call us to book a visit.";
+// The standard WhatsApp reminder. It never names a vaccine or a dose (WhatsApp Business rules on healthcare content).
+// {patient} {hospital} {hospitalPhone} {when} (the due date) and {status} (Overdue or Upcoming) are filled in for each patient.
+export const DEFAULT_REMINDER_MESSAGE = "Hello,\n\nThis is a friendly reminder from {hospital} regarding {patient}'s upcoming or overdue vaccination visit.\n\nDue Date: {when}\nStatus: {status}\n\nPlease contact us at {hospitalPhone} to schedule or confirm your visit.\n\nThank you,\n{hospital}";
+// fields that name a vaccine or a dose: not offered and not accepted
+export const REMOVED_REMINDER_FIELDS = /\{(vaccine|vaccines|dose)\}/i;
 
 // A STARTER schedule for children, loaded as a draft. A doctor or the Admin must review and approve it before due dates are shown.
 // [name, protects against, price, [[dose label, due age in days, earliest age in days, minimum gap after the previous dose]]]

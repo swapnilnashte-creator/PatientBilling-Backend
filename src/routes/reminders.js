@@ -5,7 +5,7 @@ import { allow } from '../middleware/auth.js';
 import { asyncHandler, notFound } from '../utils.js';
 
 const router = Router();
-const body = z.object({ kind: z.enum(['FOLLOW_UP', 'VACCINE']), patientId: z.coerce.number().int().positive(), ref: z.string().trim().min(1).max(40) });
+const body = z.object({ kind: z.enum(['FOLLOW_UP', 'VACCINE', 'FOLLOW_UP_CALL', 'VACCINE_CALL']), patientId: z.coerce.number().int().positive(), ref: z.string().trim().min(1).max(40) });
 
 // Who has already been sent a reminder: the list pages call this to colour the WhatsApp button.
 export async function sentMap(db, hospitalId, kind, patientIds) {
@@ -19,7 +19,7 @@ export async function sentMap(db, hospitalId, kind, patientIds) {
   return map;
 }
 
-// Staff tapped WhatsApp for this patient: remember it, with who and when. Tapping again updates the time.
+// Staff tapped WhatsApp (or Call, for the *_CALL kinds) for this patient: remember it, with who and when. Tapping again updates the time.
 router.post('/sent', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (req, res) => {
   const d = body.parse(req.body);
   const p = await pool.query('SELECT 1 FROM patients WHERE hospital_id=$1 AND id=$2 AND deleted_at IS NULL', [req.user.hospitalId, d.patientId]);

@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { pool } from '../db.js';
+import { sessionAllows } from '../supportAccess.js';
 
 export async function auth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -22,6 +23,10 @@ export async function auth(req, res, next) {
       [id, Number(payload.hospitalId)]
     );
     if (!q.rowCount) return res.status(401).json({ message: 'Account or hospital is inactive' });
+    // a support sign-in works only while the hospital's support session is open: it ends at the time chosen, or when the hospital ends it
+    if (payload.impersonatedBySuperuserId && !(await sessionAllows(Number(payload.hospitalId), Number(payload.impersonatedBySuperuserId)))) {
+      return res.status(401).json({ message: 'Support access has ended' });
+    }
     req.user = {
       id,
       hospitalId: Number(q.rows[0].hospital_id),
