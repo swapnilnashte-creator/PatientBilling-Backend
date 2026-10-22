@@ -5,6 +5,7 @@ import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { todayIst } from '../vaccination.js';
+import { mobileSchema } from '../mobile.js';
 import { hospitalHours, hospitalOpenOn, insideHospital, weekdayOf } from '../bookingSlots.js';
 import { createVisitTx } from './visits.js';
 import { ensureDoctorCodes, hospitalReasons } from './booking.js';
@@ -130,7 +131,7 @@ router.delete('/days-off/:id', allow('ADMIN'), asyncHandler(async (req, res) => 
 }));
 
 // ---- the WhatsApp message for a booking ----
-export const DEFAULT_APPOINTMENT_MESSAGE = 'Hello {patient}, this is {hospital}. Your appointment with {doctor} is booked for {date} at {time}. Booking no. {reference}. Please show the QR or this number at the counter. To change it, please call us.';
+export const DEFAULT_APPOINTMENT_MESSAGE = "Hello {patient},\n\nYour appointment at {hospital} with {doctor} is confirmed.\n\nDate: {date}\nTime: {time}\nBooking Reference: {reference}\n\nPlease show your booking reference at reception.\n\nFor changes or assistance, contact {hospitalPhone}.\n\nThank you,\n{hospital}";
 router.get('/message', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (req, res) => {
   const q = await pool.query('SELECT appointment_message FROM hospitals WHERE id=$1', [req.user.hospitalId]);
   res.json({ message: q.rows[0]?.appointment_message || null, defaultMessage: DEFAULT_APPOINTMENT_MESSAGE });
@@ -223,8 +224,20 @@ router.post('/:id/block-mobile', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(as
   res.json(result);
 }));
 router.get('/blocked', allow('ADMIN'), asyncHandler(async (req, res) => {
-  const q = await pool.query('SELECT id,mobile,created_at FROM blocked_mobiles WHERE hospital_id=$1 ORDER BY created_at DESC', [req.user.hospitalId]);
+  const q = await pool.query(`SELECT b.id,b.mobile,b.note,b.created_at,
+    (SELECT u.name FROM users u WHERE u.hospital_id=b.hospital_id AND u.id=b.blocked_by) AS blocked_by_name
+    FROM blocked_mobiles b WHERE b.hospital_id=$1 ORDER BY b.created_at DESC`, [req.user.hospitalId]);
   res.json(q.rows.map(r => ({ ...r, id: Number(r.id) })));
+}));
+// block a number without waiting for a booking from it; what it still has booked is cancelled
+router.post('/blocked', allow('ADMIN'), asyncHandler(async (req, res) => {
+  const d = z.object({ mobile: mobileSchema, note: z.string().trim().max(120).optional() }).parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const ins = await client.query('INSERT INTO blocked_mobiles(hospital_id,mobile,note,blocked_by) VALUES($1,$2,$3,$4) ON CONFLICT (hospital_id,mobile) DO NOTHING', [req.user.hospitalId, d.mobile, d.note || null, req.user.id]);
+    const c = await client.query(`UPDATE appointments SET status='CANCELLED',status_by=$3,status_at=NOW() WHERE hospital_id=$1 AND mobile=$2 AND status='BOOKED'`, [req.user.hospitalId, d.mobile, req.user.id]);
+    return { mobile: d.mobile, already: ins.rowCount === 0, cancelled: c.rowCount };
+  });
+  res.json(result);
 }));
 router.delete('/blocked/:id', allow('ADMIN'), asyncHandler(async (req, res) => {
   await pool.query('DELETE FROM blocked_mobiles WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.params.id]);

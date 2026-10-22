@@ -7,7 +7,7 @@ import { sentMap } from './reminders.js';
 import { addDays, daysBetween, todayIst } from '../vaccination.js';
 
 const router = Router();
-export const DEFAULT_FOLLOW_UP_MESSAGE = 'Hello, this is {hospital}. {patient}, {doctor} advised a follow-up visit {when}. Please call us to book a time.';
+export const DEFAULT_FOLLOW_UP_MESSAGE = "Hello {patient},\n\nGreetings from {hospital}.\n\nThis is a friendly reminder that your follow-up visit with {doctor} is due around {when}.\n\nPlease contact us at {hospitalPhone} to schedule your appointment.\n\nThank you,\n{hospital}";
 const readMessage = async (hospitalId) => {
   const q = await pool.query('SELECT follow_up_reminder_message FROM hospitals WHERE id=$1', [hospitalId]);
   return { reminderMessage: q.rows[0]?.follow_up_reminder_message || null, defaultReminderMessage: DEFAULT_FOLLOW_UP_MESSAGE };

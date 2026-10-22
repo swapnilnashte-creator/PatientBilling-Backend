@@ -12,7 +12,7 @@ const router = Router();
 // Is a support person signed in right now? Every hospital user can see this (it feeds the banner).
 router.get('/status', asyncHandler(async (req, res) => {
   const s = await openSession(pool, req.user.hospitalId);
-  res.json({ session: s ? { by: s.superuser_name || 'DhaCare support', startedAt: s.session_started_at, endsAt: s.session_ends_at } : null });
+  res.json({ session: s ? { by: s.superuser_name || 'DhaCare support', startedAt: s.session_started_at, endsAt: s.session_ends_at, emergency: s.emergency, reason: s.emergency ? s.emergency_reason : null } : null });
 }));
 
 // The Admin's box in Hospital Settings: the open code or session, and the history.
@@ -20,11 +20,11 @@ router.get('/', allow('ADMIN'), asyncHandler(async (req, res) => {
   const h = req.user.hospitalId;
   await closeStale(pool, h);
   const open = await pool.query(
-    `SELECT s.id,s.status,s.code_expires_at,s.attempts,s.session_minutes,s.session_started_at,s.session_ends_at,p.name AS superuser_name
+    `SELECT s.id,s.status,s.code_expires_at,s.attempts,s.session_minutes,s.session_started_at,s.session_ends_at,s.emergency,s.emergency_reason,p.name AS superuser_name
      FROM support_access s LEFT JOIN platform_superusers p ON p.id=s.superuser_id
      WHERE s.hospital_id=$1 AND s.status IN ('CODE','SESSION')`, [h]);
   const hist = await pool.query(
-    `SELECT s.id,s.status,s.created_at,s.session_started_at,s.session_ends_at,s.ended_at,s.ended_reason,s.session_minutes,p.name AS superuser_name,u.name AS created_by_name,
+    `SELECT s.id,s.status,s.created_at,s.session_started_at,s.session_ends_at,s.ended_at,s.ended_reason,s.session_minutes,s.emergency,s.emergency_reason,p.name AS superuser_name,u.name AS created_by_name,
             COALESCE((SELECT json_agg(json_build_object('action',e.action,'name',e.target_name,'role',e.target_role,'at',e.created_at) ORDER BY e.created_at)
                       FROM support_access_events e WHERE e.support_id=s.id AND e.action='SIGN_IN_AS'),'[]'::json) AS signins
      FROM support_access s LEFT JOIN platform_superusers p ON p.id=s.superuser_id LEFT JOIN users u ON u.id=s.created_by
@@ -33,7 +33,7 @@ router.get('/', allow('ADMIN'), asyncHandler(async (req, res) => {
   res.json({
     choices: SESSION_CHOICES, codeMinutes: CODE_MINUTES,
     code: row && row.status === 'CODE' ? { expiresAt: row.code_expires_at, attemptsLeft: Math.max(0, 5 - row.attempts), sessionMinutes: row.session_minutes } : null,
-    session: row && row.status === 'SESSION' ? { by: row.superuser_name || 'DhaCare support', startedAt: row.session_started_at, endsAt: row.session_ends_at } : null,
+    session: row && row.status === 'SESSION' ? { by: row.superuser_name || 'DhaCare support', startedAt: row.session_started_at, endsAt: row.session_ends_at, emergency: row.emergency, reason: row.emergency ? row.emergency_reason : null } : null,
     history: hist.rows,
   });
 }));
@@ -63,6 +63,8 @@ router.post('/code', allow('ADMIN'), asyncHandler(async (req, res) => {
 router.delete('/', allow('ADMIN'), asyncHandler(async (req, res) => {
   const h = req.user.hospitalId;
   await closeStale(pool, h);
+  const emergency = await pool.query(`SELECT 1 FROM support_access WHERE hospital_id=$1 AND status='SESSION' AND emergency`, [h]);
+  if (emergency.rowCount) throw forbidden('This is DhaCare emergency access, so it cannot be ended from here. It is recorded, and it ends by itself at the time shown. Please call DhaCare.');
   const q = await pool.query(
     `UPDATE support_access SET status=CASE WHEN status='SESSION' THEN 'ENDED' ELSE 'CANCELLED' END,ended_at=NOW(),
             ended_reason=CASE WHEN status='SESSION' THEN CASE WHEN $2::boolean THEN 'SUPPORT' ELSE 'HOSPITAL' END ELSE 'CANCELLED' END

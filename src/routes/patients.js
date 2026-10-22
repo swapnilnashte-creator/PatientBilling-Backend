@@ -294,6 +294,24 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
   res.json({ patient: patientQ.rows[0], summary, visits: out, access: { clinical, money } });
 }));
 
+// Every change to this patient's prescriptions (medicine added, removed, or its details changed), newest visit first, oldest change first inside a visit.
+router.get('/:id/prescription-history', allow('ADMIN', 'DOCTOR'), asyncHandler(async (req, res) => {
+  const id = z.coerce.number().int().positive().parse(req.params.id);
+  const patient = await pool.query(`SELECT id FROM patients WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL`, [id, req.user.hospitalId]);
+  if (!patient.rowCount) throw notFound('Patient not found');
+  const q = await pool.query(
+    `SELECT a.id,a.visit_id,a.action,a.name,a.before_data,a.after_data,a.changed_fields,a.changed_by_name,a.changed_by_role,a.by_support,a.visit_status,a.created_at,a.updated_at,
+            v.created_at AS visit_date,v.visit_number,v.daily_number,d.name AS doctor_name
+     FROM prescription_audit a
+     JOIN visits v ON v.hospital_id=a.hospital_id AND v.id=a.visit_id
+     JOIN users d ON d.id=a.doctor_id AND d.hospital_id=a.hospital_id
+     WHERE a.hospital_id=$1 AND a.patient_id=$2
+     ORDER BY v.created_at DESC,a.visit_id DESC,a.id ASC LIMIT 600`,
+    [req.user.hospitalId, id]
+  );
+  res.json(q.rows);
+}));
+
 router.get('/:id/history', asyncHandler(async (req, res) => {
   const patient = await pool.query(
     `SELECT id,full_name,mobile,gender,date_of_birth,dob_estimated,address FROM patients

@@ -12,7 +12,7 @@ import billingRoutes from './superAdminBilling.js';
 import { exportHospital, purgeHospital } from '../hospitalPurge.js';
 import { networkReport } from '../proxyCheck.js';
 import { describe, invalidateMaintenance, maintenanceRow } from '../maintenance.js';
-import { MAX_ATTEMPTS, closeStale, hashCode, openSession, sameHash } from '../supportAccess.js';
+import { MAX_ATTEMPTS, closeStale, ensureEmergencySession, hashCode, openSession, sameHash } from '../supportAccess.js';
 
 const router = Router();
 router.use(allow('SUPER_ADMIN'));
@@ -212,6 +212,17 @@ router.post('/hospitals/:id/support/verify', asyncHandler(async (req, res) => {
   if (outcome.none) throw Object.assign(new Error('This hospital has no valid support code. Ask its Admin to create one in Hospital Settings > Support access.'), { status: 400, needCode: true });
   if (outcome.wrong) throw Object.assign(new Error(outcome.locked ? 'That code is not correct and the code is now cancelled. Ask the hospital Admin for a new one.' : `That code is not correct. ${outcome.attemptsLeft} ${outcome.attemptsLeft === 1 ? 'try' : 'tries'} left.`), { status: 400, attemptsLeft: outcome.attemptsLeft });
   res.json({ endsAt: outcome.endsAt });
+}));
+
+// Emergency access, for when the hospital cannot give a code. A written reason is required; the hospital sees a red banner and the reason, for one hour.
+router.post('/hospitals/:id/support/emergency', asyncHandler(async (req, res) => {
+  const hospitalId = z.coerce.number().int().positive().parse(req.params.id);
+  const { reason } = z.object({ reason: z.string().trim().min(10, 'Write the reason in at least 10 characters').max(300) }).parse(req.body);
+  const hospital = await pool.query('SELECT id FROM hospitals WHERE id=$1 AND is_active=TRUE', [hospitalId]);
+  if (!hospital.rowCount) throw badRequest('Hospital is inactive or does not exist');
+  await withTransaction((client) => ensureEmergencySession(client, hospitalId, req.user.id, reason));
+  const session = await openSession(pool, hospitalId);
+  res.json({ endsAt: session.session_ends_at });
 }));
 
 router.get('/hospitals/:id/users', asyncHandler(async (req, res) => {

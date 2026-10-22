@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, forbidden, money, notFound } from '../utils.js';
+import { recordPrescriptionChanges } from '../prescriptionAudit.js';
 
 const router = Router();
 
@@ -386,6 +387,9 @@ router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req
       const taken = others.rows.find(o => (o.medicine_id && item.medicineId && Number(o.medicine_id) === Number(item.medicineId)) || String(o.name).trim().toLowerCase() === item.name.trim().toLowerCase());
       if (taken) throw badRequest(`${item.name} is already prescribed by ${taken.doctor_name} in this visit, so it cannot be added again.`);
     }
+    // what was there before, so every change can be recorded (who, when, from what to what)
+    const before = await client.query(`SELECT medicine_id,name,composition,dose,timing,duration_days,note FROM visit_prescription_items WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
+    await recordPrescriptionChanges(client, { hospitalId: req.user.hospitalId, visit, user: req.user, before: before.rows, after: data.items });
     await client.query(`DELETE FROM visit_prescription_items WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
     for (let index = 0; index < data.items.length; index += 1) {
       const item = data.items[index];
