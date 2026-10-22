@@ -148,6 +148,16 @@ router.post('/:id/whatsapp-sent', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(a
   if (!q.rowCount) throw notFound('Appointment not found');
   res.json({ sentAt: q.rows[0].whatsapp_sent_at, sentBy: req.user.name });
 }));
+// staff tapped Call for this booking: remember who and when, so the next person sees the patient was already phoned
+router.post('/:id/called', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
+  const q = await pool.query('UPDATE appointments SET called_at=NOW(),called_by=$3 WHERE hospital_id=$1 AND id=$2 RETURNING called_at', [req.user.hospitalId, req.params.id, req.user.id]);
+  if (!q.rowCount) throw notFound('Appointment not found');
+  res.json({ calledAt: q.rows[0].called_at, calledBy: req.user.name });
+}));
+router.post('/:id/uncalled', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
+  await pool.query('UPDATE appointments SET called_at=NULL,called_by=NULL WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.params.id]);
+  res.json({ ok: true });
+}));
 router.post('/:id/whatsapp-unsent', allow('ADMIN', 'RECEPTIONIST'), asyncHandler(async (req, res) => {
   await pool.query('UPDATE appointments SET whatsapp_sent_at=NULL,whatsapp_sent_by=NULL WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.params.id]);
   res.json({ ok: true });
@@ -173,6 +183,7 @@ const COLUMNS = `a.id,a.reference,a.doctor_id,u.name AS doctor_name,a.slot_at,to
   v.daily_number AS token,
   a.reschedule_count,a.previous_slot_at,
   a.whatsapp_sent_at,(SELECT su.name FROM users su WHERE su.hospital_id=a.hospital_id AND su.id=a.whatsapp_sent_by) AS whatsapp_sent_by_name,
+  a.called_at,(SELECT cu.name FROM users cu WHERE cu.hospital_id=a.hospital_id AND cu.id=a.called_by) AS called_by_name,
   (SELECT COUNT(*)::int FROM appointments n WHERE n.hospital_id=a.hospital_id AND n.mobile=a.mobile AND n.status='NO_SHOW' AND n.slot_day > (NOW() AT TIME ZONE 'Asia/Kolkata')::date - 30) AS earlier_no_shows,
   EXISTS (SELECT 1 FROM blocked_mobiles bm WHERE bm.hospital_id=a.hospital_id AND bm.mobile=a.mobile) AS blocked,
   (a.status='ARRIVED' AND v.status='WAITING_FOR_DOCTOR'

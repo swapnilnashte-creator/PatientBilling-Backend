@@ -369,7 +369,8 @@ router.get('/due', asyncHandler(async (req, res) => {
   rows.sort((a, b) => a.worst - b.worst || a.name.localeCompare(b.name));
   // a reminder counts as sent for the earliest due date; a newly due dose is a new reminder
   const sent = await sentMap(pool, hospitalId, 'VACCINE', rows.map(r => r.patientId));
-  for (const r of rows) { r.reminderRef = r.doses[0].dueOn; r.reminder = sent.get(`${r.patientId}:${r.reminderRef}`) || null; }
+  const called = await sentMap(pool, hospitalId, 'VACCINE_CALL', rows.map(r => r.patientId));
+  for (const r of rows) { r.reminderRef = r.doses[0].dueOn; r.reminder = sent.get(`${r.patientId}:${r.reminderRef}`) || null; r.call = called.get(`${r.patientId}:${r.reminderRef}`) || null; }
   res.json({ ...settings, days, totals, total: rows.length, rows: rows.slice(0, 500) });
 }));
 

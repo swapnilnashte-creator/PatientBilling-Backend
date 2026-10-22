@@ -56,7 +56,8 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
   }
   rows.sort((a, b) => a.daysLeft - b.daysLeft || a.name.localeCompare(b.name));
   const sent = await sentMap(pool, hospitalId, 'FOLLOW_UP', rows.map(r => r.patientId));
-  for (const r of rows) r.reminder = sent.get(`${r.patientId}:${r.visitId}`) || null;
+  const called = await sentMap(pool, hospitalId, 'FOLLOW_UP_CALL', rows.map(r => r.patientId));
+  for (const r of rows) { r.reminder = sent.get(`${r.patientId}:${r.visitId}`) || null; r.call = called.get(`${r.patientId}:${r.visitId}`) || null; }
   res.json({ days, totals, total: rows.length, rows: rows.slice(0, 500), ...(await readMessage(hospitalId)) });
 }));
 
