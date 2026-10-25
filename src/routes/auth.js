@@ -80,7 +80,7 @@ function sessionFor(user) {
     token,
     user: {
       id: Number(user.id), hospitalId: Number(user.hospital_id), name: user.name,
-      mobile: user.mobile, email: user.email, role: user.role, hospitalName: user.hospital_name,
+      mobile: user.mobile, email: user.email, role: user.role, hospitalName: user.hospital_name, speciality: user.speciality || null,
     },
   };
 }
@@ -109,7 +109,7 @@ router.post('/login', loginGuard, asyncHandler(async (req, res) => {
   const maintenance = await currentMaintenance();
   if (maintenance.blocking) return res.status(503).json({ message: blockedMessage(maintenance), maintenance });
   const q = await pool.query(
-    `SELECT u.id,u.hospital_id,u.name,u.mobile,u.email,u.password_hash,u.role,h.name AS hospital_name
+    `SELECT u.id,u.hospital_id,u.name,u.mobile,u.email,u.password_hash,u.role,u.speciality,h.name AS hospital_name
      FROM users u JOIN hospitals h ON h.id=u.hospital_id
      WHERE u.mobile=$1 AND u.is_active=TRUE AND u.deleted_at IS NULL AND h.is_active=TRUE
      ORDER BY lower(h.name),u.id`,
@@ -141,7 +141,7 @@ router.post('/select-firm', asyncHandler(async (req, res) => {
   catch { throw badRequest('Firm selection expired. Please log in again.'); }
   if (selection.purpose !== 'FIRM_SELECTION' || !Array.isArray(selection.userIds)) throw badRequest('Invalid firm selection');
   const q = await pool.query(
-    `SELECT u.id,u.hospital_id,u.name,u.mobile,u.email,u.role,h.name AS hospital_name
+    `SELECT u.id,u.hospital_id,u.name,u.mobile,u.email,u.role,u.speciality,h.name AS hospital_name
      FROM users u JOIN hospitals h ON h.id=u.hospital_id
      WHERE u.id=ANY($1::bigint[]) AND u.hospital_id=$2
        AND u.is_active=TRUE AND u.deleted_at IS NULL AND h.is_active=TRUE`,

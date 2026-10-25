@@ -58,7 +58,10 @@ async function payload(hospitalId) {
 }
 
 router.get('/', asyncHandler(async (req, res) => {
-  res.json(await payload(req.user.hospitalId));
+  const row = await payload(req.user.hospitalId);
+  // the signed-in doctor's own speciality, read fresh, so a change by the Admin shows without signing in again
+  if (req.user.role === 'DOCTOR') row.mySpeciality = (await pool.query('SELECT speciality FROM users WHERE hospital_id=$1 AND id=$2', [req.user.hospitalId, req.user.id])).rows[0]?.speciality || null;
+  res.json(row);
 }));
 
 // ---------- letterhead settings (Admin) ----------
