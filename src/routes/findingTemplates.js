@@ -20,7 +20,7 @@ const medicineSchema = z.object({
 });
 const templateBody = z.object({
   name: z.string().trim().min(2).max(80),
-  group: z.string().trim().max(60).optional().default(''),
+  group: z.string('Choose a group, or add a new one').trim().min(1, 'Choose a group, or add a new one').max(60),
   findings: z.string().trim().max(2000).optional().default(''),
   advice: z.string().trim().max(1000).optional().default(''),
   isActive: z.boolean().optional().default(true),

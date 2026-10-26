@@ -9,6 +9,7 @@ import { asyncHandler, badRequest } from '../utils.js';
 import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
 import { mobileSchema } from '../mobile.js';
 import { blockedMessage, currentMaintenance } from '../maintenance.js';
+import { auth } from '../middleware/auth.js';
 
 const router = Router();
 
@@ -68,6 +69,12 @@ const loginSchema = z.object({
 const firmSelectionSchema = z.object({
   selectionToken: z.string().min(1),
   hospitalId: z.coerce.number().int().positive(),
+  role: z.enum(['ADMIN', 'DOCTOR', 'RECEPTIONIST']).optional(), // needed when the same mobile holds more than one role in that hospital
+});
+
+const switchRoleSchema = z.object({
+  role: z.enum(['ADMIN', 'DOCTOR', 'RECEPTIONIST']),
+  password: z.string().min(1),
 });
 
 function sessionFor(user) {
@@ -130,6 +137,7 @@ router.post('/login', loginGuard, asyncHandler(async (req, res) => {
   res.json({
     requiresFirmSelection: true,
     selectionToken,
+    // one entry per account: the same mobile can hold more than one role in a hospital (a one-doctor clinic: Admin and Doctor)
     firms: validatedUsers.map(user => ({ hospitalId: Number(user.hospital_id), hospitalName: user.hospital_name, role: user.role })),
   });
 }));
@@ -144,10 +152,46 @@ router.post('/select-firm', asyncHandler(async (req, res) => {
     `SELECT u.id,u.hospital_id,u.name,u.mobile,u.email,u.role,u.speciality,h.name AS hospital_name
      FROM users u JOIN hospitals h ON h.id=u.hospital_id
      WHERE u.id=ANY($1::bigint[]) AND u.hospital_id=$2
+       AND ($3::text IS NULL OR u.role=$3)
        AND u.is_active=TRUE AND u.deleted_at IS NULL AND h.is_active=TRUE`,
-    [selection.userIds, data.hospitalId]
+    [selection.userIds, data.hospitalId, data.role || null]
   );
-  if (q.rowCount !== 1) throw badRequest('You do not have access to this firm');
+  if (q.rowCount < 1) throw badRequest('You do not have access to this firm');
+  if (q.rowCount > 1) throw badRequest('Choose the role to sign in with');
+  res.json(sessionFor(q.rows[0]));
+}));
+
+// The same person's other role in this hospital (for example Admin who is also the Doctor): sign in as that role without leaving.
+// The password is asked again, so a Doctor's session alone can never turn into an Admin's.
+router.get('/my-roles', auth, asyncHandler(async (req, res) => {
+  if (!req.user.hospitalId || req.user.impersonatedBySuperuserId) return res.json({ roles: [] });
+  const q = await pool.query(
+    `SELECT o.role FROM users me JOIN users o ON o.hospital_id=me.hospital_id AND o.mobile=me.mobile AND o.id<>me.id
+     WHERE me.id=$1 AND o.is_active=TRUE AND o.deleted_at IS NULL ORDER BY o.role`,
+    [req.user.id]
+  );
+  res.json({ roles: q.rows.map(r => r.role) });
+}));
+
+// wrong passwords are counted against the signed-in person's mobile, like a sign-in
+const withOwnMobile = asyncHandler(async (req, _res, next) => {
+  const m = await pool.query(`SELECT mobile FROM users WHERE id=$1`, [req.user.id]);
+  req.body = { ...req.body, mobile: m.rows[0]?.mobile };
+  next();
+});
+
+router.post('/switch-role', auth, withOwnMobile, loginGuard, asyncHandler(async (req, res) => {
+  const data = switchRoleSchema.parse(req.body);
+  if (!req.user.hospitalId || req.user.impersonatedBySuperuserId) throw badRequest('Switching roles is not available in this session');
+  const q = await pool.query(
+    `SELECT o.id,o.hospital_id,o.name,o.mobile,o.email,o.password_hash,o.role,o.speciality,h.name AS hospital_name
+     FROM users me JOIN users o ON o.hospital_id=me.hospital_id AND o.mobile=me.mobile
+     JOIN hospitals h ON h.id=o.hospital_id
+     WHERE me.id=$1 AND o.role=$2 AND o.id<>me.id AND o.is_active=TRUE AND o.deleted_at IS NULL AND h.is_active=TRUE`,
+    [req.user.id, data.role]
+  );
+  if (!q.rowCount) throw badRequest('You do not have that role in this hospital');
+  if (!(await bcrypt.compare(data.password, q.rows[0].password_hash))) { res.locals.loginFailed = true; throw badRequest(`Wrong password for the ${data.role.toLowerCase()} account`); }
   res.json(sessionFor(q.rows[0]));
 }));
 

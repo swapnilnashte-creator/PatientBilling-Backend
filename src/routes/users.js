@@ -7,7 +7,8 @@ import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { mobileSchema } from '../mobile.js';
 import { autoTopUp, deactivationImpact, doctorImpact, refreshOpenMonthlyInvoice } from '../billing/doctors.js';
 
-export const SPECIALITIES = ['GENERAL_PHYSICIAN', 'PAEDIATRICIAN', 'DENTIST', 'GYNAECOLOGIST', 'ORTHOPAEDIC', 'ENT', 'DERMATOLOGIST', 'OTHER'];
+// Only these two are offered for now (the others come back by adding them here and in frontend/src/speciality.js).
+export const SPECIALITIES = ['GENERAL_PHYSICIAN', 'PAEDIATRICIAN'];
 const router = Router();
 router.use(allow('ADMIN'));
 
@@ -58,6 +59,13 @@ router.post('/', asyncHandler(async (req, res) => {
     if (impact) return needsConfirm(res, impact);
   }
   const hash = await bcrypt.hash(data.password, 12);
+  // the same mobile may hold another role (a one-doctor clinic: Admin and Doctor), but not the same role twice
+  const sameRole = await pool.query(`SELECT 1 FROM users WHERE hospital_id=$1 AND mobile=$2 AND role=$3 AND deleted_at IS NULL`, [req.user.hospitalId, data.mobile, data.role]);
+  if (sameRole.rowCount) throw badRequest(`This mobile number already has ${data.role === 'ADMIN' ? 'an admin' : `a ${data.role.toLowerCase()}`} account in this hospital`);
+  if (data.email) {
+    const mail = await pool.query(`SELECT 1 FROM users WHERE hospital_id=$1 AND lower(email)=$2 AND role=$3 AND deleted_at IS NULL`, [req.user.hospitalId, data.email, data.role]);
+    if (mail.rowCount) throw badRequest(`This email is already used by another ${data.role.toLowerCase()} account`);
+  }
   const created = await withTransaction(async (client) => {
     const q = await client.query(
       `INSERT INTO users(hospital_id,name,mobile,email,password_hash,role,qualification,registration_no,speciality)
