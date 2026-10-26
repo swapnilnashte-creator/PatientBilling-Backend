@@ -7,12 +7,14 @@ import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { mobileSchema } from '../mobile.js';
 import { autoTopUp, deactivationImpact, doctorImpact, refreshOpenMonthlyInvoice } from '../billing/doctors.js';
 
+// Only these two are offered for now (the others come back by adding them here and in frontend/src/speciality.js).
+export const SPECIALITIES = ['GENERAL_PHYSICIAN', 'PAEDIATRICIAN'];
 const router = Router();
 router.use(allow('ADMIN'));
 
 router.get('/', asyncHandler(async (req, res) => {
   const q = await pool.query(
-    `SELECT id,name,mobile,email,role,is_active,created_at,qualification,registration_no
+    `SELECT id,name,mobile,email,role,is_active,created_at,qualification,registration_no,speciality
      FROM users WHERE hospital_id=$1 AND deleted_at IS NULL ORDER BY role,name`,
     [req.user.hospitalId]
   );
@@ -32,6 +34,7 @@ const userSchema = z.object({
   role: z.enum(['ADMIN','DOCTOR','RECEPTIONIST']),
   qualification: z.string().trim().max(160).optional().default(''),
   registrationNo: z.string().trim().max(40).optional().default(''),
+  speciality: z.enum(SPECIALITIES).nullable().optional().default(null),
   acknowledgeBilling: z.boolean().optional().default(false),
 });
 
@@ -56,12 +59,19 @@ router.post('/', asyncHandler(async (req, res) => {
     if (impact) return needsConfirm(res, impact);
   }
   const hash = await bcrypt.hash(data.password, 12);
+  // the same mobile may hold another role (a one-doctor clinic: Admin and Doctor), but not the same role twice
+  const sameRole = await pool.query(`SELECT 1 FROM users WHERE hospital_id=$1 AND mobile=$2 AND role=$3 AND deleted_at IS NULL`, [req.user.hospitalId, data.mobile, data.role]);
+  if (sameRole.rowCount) throw badRequest(`This mobile number already has ${data.role === 'ADMIN' ? 'an admin' : `a ${data.role.toLowerCase()}`} account in this hospital`);
+  if (data.email) {
+    const mail = await pool.query(`SELECT 1 FROM users WHERE hospital_id=$1 AND lower(email)=$2 AND role=$3 AND deleted_at IS NULL`, [req.user.hospitalId, data.email, data.role]);
+    if (mail.rowCount) throw badRequest(`This email is already used by another ${data.role.toLowerCase()} account`);
+  }
   const created = await withTransaction(async (client) => {
     const q = await client.query(
-      `INSERT INTO users(hospital_id,name,mobile,email,password_hash,role,qualification,registration_no)
-       VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-       RETURNING id,name,mobile,email,role,is_active,created_at,qualification,registration_no`,
-      [req.user.hospitalId, data.name, data.mobile, data.email || null, hash, data.role, data.role === 'DOCTOR' ? (data.qualification || null) : null, data.role === 'DOCTOR' ? (data.registrationNo || null) : null]
+      `INSERT INTO users(hospital_id,name,mobile,email,password_hash,role,qualification,registration_no,speciality)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id,name,mobile,email,role,is_active,created_at,qualification,registration_no,speciality`,
+      [req.user.hospitalId, data.name, data.mobile, data.email || null, hash, data.role, data.role === 'DOCTOR' ? (data.qualification || null) : null, data.role === 'DOCTOR' ? (data.registrationNo || null) : null, data.role === 'DOCTOR' ? data.speciality : null]
     );
     if (data.role === 'DOCTOR') {
       // a new doctor joins the letterhead automatically while there is room (Settings can change it)
@@ -129,10 +139,11 @@ router.patch('/:id/name', asyncHandler(async (req, res) => {
 }));
 
 router.patch('/:id/profile', asyncHandler(async (req, res) => {
-  const { qualification, registrationNo } = z.object({ qualification: z.string().trim().max(160), registrationNo: z.string().trim().max(40).optional().default('') }).parse(req.body);
+  const { qualification, registrationNo, speciality } = z.object({ qualification: z.string().trim().max(160), registrationNo: z.string().trim().max(40).optional().default(''), speciality: z.enum(SPECIALITIES).nullable().optional() }).parse(req.body);
+  // the speciality is changed only when it is sent; leaving it out keeps what is there
   const q = await pool.query(
-    `UPDATE users SET qualification=$1,registration_no=$2,updated_at=NOW() WHERE id=$3 AND hospital_id=$4 AND role='DOCTOR' AND deleted_at IS NULL RETURNING id,name,qualification,registration_no`,
-    [qualification || null, registrationNo || null, req.params.id, req.user.hospitalId]
+    `UPDATE users SET qualification=$1,registration_no=$2,speciality=CASE WHEN $5::boolean THEN $6 ELSE speciality END,updated_at=NOW() WHERE id=$3 AND hospital_id=$4 AND role='DOCTOR' AND deleted_at IS NULL RETURNING id,name,qualification,registration_no,speciality`,
+    [qualification || null, registrationNo || null, req.params.id, req.user.hospitalId, speciality !== undefined, speciality ?? null]
   );
   if (!q.rowCount) throw notFound('Doctor not found');
   res.json(q.rows[0]);

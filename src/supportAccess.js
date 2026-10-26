@@ -34,7 +34,7 @@ export async function sessionAllows(hospitalId, superuserId) {
 }
 
 // Emergency access: a Super Admin who cannot get the hospital's code chooses this instead. It needs a written reason and is never silent: a support session is
-// opened that the hospital sees (red banner, a line with the reason in its Support history). It lasts EMERGENCY_MINUTES and the hospital cannot end it.
+// opened that the hospital sees (red banner, a line with the reason in its Support history). It lasts EMERGENCY_MINUTES and the hospital's Admin can end it at any time.
 export const EMERGENCY_MINUTES = 60;
 export async function ensureEmergencySession(db, hospitalId, superuserId, reason) {
   await closeStale(db, hospitalId);

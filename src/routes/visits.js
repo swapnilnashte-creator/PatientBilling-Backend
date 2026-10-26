@@ -137,6 +137,26 @@ router.get('/doctors', asyncHandler(async (req, res) => {
   res.json(q.rows);
 }));
 
+// The patient's open visit of today that is not paid yet (waiting, with a doctor, or payment due), so a doctor can join it
+// instead of making a second visit. null when there is none.
+router.get('/open-for-patient/:patientId', asyncHandler(async (req, res) => {
+  const patientId = z.coerce.number().int().positive().parse(req.params.patientId);
+  const q = await pool.query(
+    `SELECT v.id,v.status,v.daily_number,v.visit_number,v.created_at,v.doctor_id,
+            (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status) ORDER BY vd.position)
+             FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
+             WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id) AS doctors
+     FROM visits v
+     WHERE v.hospital_id=$1 AND v.patient_id=$2 AND v.status IN ('WAITING_FOR_DOCTOR','WITH_DOCTOR','PAYMENT_PENDING')
+       AND (v.created_at AT TIME ZONE 'Asia/Kolkata')::date=(NOW() AT TIME ZONE 'Asia/Kolkata')::date
+     ORDER BY v.id DESC LIMIT 1`,
+    [req.user.hospitalId, patientId]
+  );
+  if (!q.rowCount) return res.json({ visit: null });
+  const v = q.rows[0];
+  res.json({ visit: { id: Number(v.id), status: v.status, token: v.daily_number, visitNumber: v.visit_number, createdAt: v.created_at, doctors: (v.doctors || []).map(d => ({ id: Number(d.id), name: d.name, position: d.position, status: d.status })), mine: (v.doctors || []).some(d => Number(d.id) === Number(req.user.id)) } });
+}));
+
 // Vitals taken for a visit. Every reading is optional; an empty value clears it.
 const vital = (min, max, whole = false) => z.preprocess(
   v => (v === '' || v === undefined ? null : v),
@@ -233,6 +253,58 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
     return created;
   });
   res.status(201).json(visit);
+}));
+
+// A doctor adds themselves to the patient's open, unpaid visit: one token and one bill, however many doctors the patient sees.
+//  - payment due: the visit is reopened and goes back to "with doctor", with this doctor, so their charges join the same bill
+//  - waiting for, or with, another doctor: this doctor is added next in line and the patient comes to them when that doctor finishes
+// A paid visit stays closed (a new visit is needed), and a doctor who is already on the visit cannot be added twice.
+router.post('/:id/add-me', allow('DOCTOR'), asyncHandler(async (req, res) => {
+  const result = await withTransaction(async (client) => {
+    const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
+    if (visit.status === 'COMPLETED') throw badRequest('This visit is already paid, so it is closed. Register a new visit for the patient instead.');
+    if (!['WAITING_FOR_DOCTOR', 'WITH_DOCTOR', 'PAYMENT_PENDING'].includes(visit.status)) throw badRequest('This visit has ended. Register a new visit for the patient instead.');
+    await validateDoctors(client, req.user.hospitalId, [Number(req.user.id)]);
+    const already = await client.query(`SELECT status FROM visit_doctors WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, req.params.id, req.user.id]);
+    if (already.rowCount) throw badRequest(already.rows[0].status === 'COMPLETED' ? 'You have already seen this patient in this visit.' : 'You are already on this visit.');
+    const nextPosition = (await client.query(`SELECT COALESCE(MAX(position),0)+1 AS p FROM visit_doctors WHERE hospital_id=$1 AND visit_id=$2`, [req.user.hospitalId, req.params.id])).rows[0].p;
+
+    if (visit.status === 'PAYMENT_PENDING') {
+      // the doctor starts now, so the same one-at-a-time rule as starting a visit applies
+      const open = await client.query(
+        `SELECT v.created_at,v.daily_number,p.full_name FROM visits v JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
+         WHERE v.hospital_id=$1 AND v.doctor_id=$2 AND v.status='WITH_DOCTOR' ORDER BY v.updated_at LIMIT 1`,
+        [req.user.hospitalId, req.user.id]
+      );
+      if (open.rowCount) {
+        const o = open.rows[0];
+        const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+        throw badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`);
+      }
+      await client.query(
+        `INSERT INTO visit_doctors(hospital_id,visit_id,doctor_id,position,status,started_at,self_added,added_by)
+         VALUES($1,$2,$3,$4,'IN_PROGRESS',NOW(),TRUE,$3)`,
+        [req.user.hospitalId, req.params.id, req.user.id, nextPosition]
+      );
+      const v = await client.query(
+        `UPDATE visits SET doctor_id=$3,status='WITH_DOCTOR',doctor_notes=NULL,doctor_notes_updated_at=NULL,doctor_notes_updated_by=NULL,
+                doctor_billing_finalized=FALSE,updated_at=NOW()
+         WHERE id=$1 AND hospital_id=$2 RETURNING *`,
+        [req.params.id, req.user.hospitalId, req.user.id]
+      );
+      return { visit: v.rows[0], reopened: true, doctors: await getVisitDoctors(client, req.user.hospitalId, req.params.id) };
+    }
+
+    await client.query(
+      `INSERT INTO visit_doctors(hospital_id,visit_id,doctor_id,position,status,self_added,added_by)
+       VALUES($1,$2,$3,$4,'WAITING',TRUE,$3)`,
+      [req.user.hospitalId, req.params.id, req.user.id, nextPosition]
+    );
+    await client.query(`UPDATE visits SET updated_at=NOW() WHERE id=$1 AND hospital_id=$2`, [req.params.id, req.user.hospitalId]);
+    const current = await client.query(`SELECT name FROM users WHERE id=$1 AND hospital_id=$2`, [visit.doctor_id, req.user.hospitalId]);
+    return { visit, queued: true, after: current.rows[0]?.name || null, doctors: await getVisitDoctors(client, req.user.hospitalId, req.params.id) };
+  });
+  res.status(200).json(result);
 }));
 
 router.put('/:id/doctors', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, res) => {

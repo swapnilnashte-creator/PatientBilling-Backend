@@ -59,12 +59,10 @@ router.post('/code', allow('ADMIN'), asyncHandler(async (req, res) => {
   res.status(201).json(result);
 }));
 
-// Cancel the code, or end the support session now.
+// Cancel the code, or end the support session now (an emergency access too: the hospital's Admin can always end it).
 router.delete('/', allow('ADMIN'), asyncHandler(async (req, res) => {
   const h = req.user.hospitalId;
   await closeStale(pool, h);
-  const emergency = await pool.query(`SELECT 1 FROM support_access WHERE hospital_id=$1 AND status='SESSION' AND emergency`, [h]);
-  if (emergency.rowCount) throw forbidden('This is DhaCare emergency access, so it cannot be ended from here. It is recorded, and it ends by itself at the time shown. Please call DhaCare.');
   const q = await pool.query(
     `UPDATE support_access SET status=CASE WHEN status='SESSION' THEN 'ENDED' ELSE 'CANCELLED' END,ended_at=NOW(),
             ended_reason=CASE WHEN status='SESSION' THEN CASE WHEN $2::boolean THEN 'SUPPORT' ELSE 'HOSPITAL' END ELSE 'CANCELLED' END
