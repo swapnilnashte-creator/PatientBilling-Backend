@@ -63,8 +63,8 @@ async function getSettlementBreakdown(client, hospitalId, visitId) {
 
 async function recordDoctorSettlements(client, hospitalId, visitId, paymentId) {
   await client.query(
-    `INSERT INTO payment_doctor_settlements(hospital_id,payment_id,visit_id,doctor_id,amount)
-     SELECT vd.hospital_id,$3,vd.visit_id,vd.doctor_id,COALESCE(SUM(vc.amount),0)::numeric(12,2)
+    `INSERT INTO payment_doctor_settlements(hospital_id,payment_id,visit_id,doctor_id,amount,settled_at)
+     SELECT vd.hospital_id,$3,vd.visit_id,vd.doctor_id,COALESCE(SUM(vc.amount),0)::numeric(12,2),visit_now($2::bigint)
      FROM visit_doctors vd
      LEFT JOIN visit_charges vc ON vc.hospital_id=vd.hospital_id AND vc.visit_id=vd.visit_id
        AND vc.doctor_id=vd.doctor_id
@@ -180,7 +180,9 @@ const vitalsParams = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temp
 const anyVital = (v) => [v.weightKg, v.heightCm, v.heartRate, v.spo2, v.temperature, v.bpSystolic].some(x => x !== null && x !== undefined);
 
 // Creates a visit (visit number, daily token, doctors) inside the caller's transaction.
-export async function createVisitTx(client, hospitalId, userId, patientId, doctorIds) {
+// visitDate (YYYY-MM-DD, an earlier day) enters the visit on that day: its token comes from that day, and created_at is that day at noon India time
+// (a minute later for each token, so the day keeps its order). entered_late_at keeps when it was really entered.
+export async function createVisitTx(client, hospitalId, userId, patientId, doctorIds, visitDate = null) {
   await validateDoctors(client, hospitalId, doctorIds);
   const numberQ = await client.query(
     `INSERT INTO hospital_visit_counters(hospital_id,next_number)
@@ -193,16 +195,21 @@ export async function createVisitTx(client, hospitalId, userId, patientId, docto
   // the daily token restarts at 1 each day (India time) for this hospital
   const dailyQ = await client.query(
     `INSERT INTO hospital_daily_visit_counters(hospital_id,day,next_number)
-     VALUES($1,(NOW() AT TIME ZONE 'Asia/Kolkata')::date,2)
+     VALUES($1,COALESCE($2::date,(NOW() AT TIME ZONE 'Asia/Kolkata')::date),2)
      ON CONFLICT (hospital_id,day) DO UPDATE
      SET next_number=hospital_daily_visit_counters.next_number+1
      RETURNING next_number-1 AS daily_number`,
-    [hospitalId]
+    [hospitalId, visitDate]
   );
   const q = await client.query(
-    `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by)
-     VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, patientId, doctorIds[0], userId]
+    visitDate
+      ? `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by,created_at,entered_late_at)
+         VALUES($1,$2,$3,$4,$5,$6,(($7::date + TIME '12:00') AT TIME ZONE 'Asia/Kolkata') + make_interval(mins=>$3::int-1),NOW()) RETURNING *`
+      : `INSERT INTO visits(hospital_id,visit_number,daily_number,patient_id,doctor_id,created_by)
+         VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
+    visitDate
+      ? [hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, patientId, doctorIds[0], userId, visitDate]
+      : [hospitalId, numberQ.rows[0].visit_number, dailyQ.rows[0].daily_number, patientId, doctorIds[0], userId]
   );
   for (let index = 0; index < doctorIds.length; index += 1) {
     await client.query(
@@ -222,6 +229,7 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
     vitals: vitalsSchema.optional(),
     doctorIds: doctorIdsSchema.optional(),
     doctorId: z.coerce.number().int().positive().optional(),
+    visitDate: z.string().date('Choose a valid visit date').optional(),
   }).parse(req.body);
 
   let doctorIds = data.doctorIds || (data.doctorId ? [data.doctorId] : []);
@@ -230,6 +238,19 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
     doctorIds = [Number(req.user.id)];
   }
   if (!doctorIds.length) throw badRequest('Select at least one doctor');
+
+  // an earlier-dated visit: Admin and Reception only, up to 30 days back (today's date is an ordinary visit)
+  let visitDate = null;
+  if (data.visitDate) {
+    const t = await pool.query(`SELECT to_char((NOW() AT TIME ZONE 'Asia/Kolkata')::date,'YYYY-MM-DD') AS today, to_char((NOW() AT TIME ZONE 'Asia/Kolkata')::date-30,'YYYY-MM-DD') AS earliest`);
+    const { today, earliest } = t.rows[0];
+    if (data.visitDate > today) throw badRequest('The visit date cannot be in the future');
+    if (data.visitDate < today) {
+      if (!['ADMIN', 'RECEPTIONIST'].includes(req.user.role)) throw forbidden('Only the Admin or Reception can enter a visit with an earlier date');
+      if (data.visitDate < earliest) throw badRequest('A visit can be entered up to 30 days back');
+      visitDate = data.visitDate;
+    }
+  }
 
   const check = await pool.query(
     `SELECT
@@ -242,7 +263,7 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
   if (!check.rows[0].has_age) throw badRequest('Age or date of birth is required to register a visit');
   if (!check.rows[0].has_gender) throw badRequest('Gender is required to register a visit');
   const visit = await withTransaction(async (client) => {
-    const created = await createVisitTx(client, req.user.hospitalId, req.user.id, data.patientId, doctorIds);
+    const created = await createVisitTx(client, req.user.hospitalId, req.user.id, data.patientId, doctorIds, visitDate);
     if (data.vitals && anyVital(data.vitals)) {
       const v = await client.query(
         `UPDATE visits SET weight_kg=$3,height_cm=$4,heart_rate=$5,spo2=$6,temperature=$7,temperature_unit=$8,bp_systolic=$9,bp_diastolic=$10,vitals_updated_at=NOW() WHERE id=$1 AND hospital_id=$2 RETURNING *`,
@@ -366,7 +387,7 @@ router.get('/', asyncHandler(async (req, res) => {
     params.push(dateTo); where += ` AND v.created_at < ($${params.length}::date + INTERVAL '1 day')`;
   }
   const q = await pool.query(
-    `SELECT v.id,v.visit_number,v.daily_number,v.doctor_id,v.status,v.created_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
+    `SELECT v.id,v.visit_number,v.daily_number,v.doctor_id,v.status,v.created_at,v.entered_late_at,v.completed_at,v.doctor_billing_finalized,v.left_at,v.left_note,
             p.id AS patient_id,p.full_name,p.mobile,p.whatsapp_mobile,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,d.name AS doctor_name,
             (SELECT json_agg(json_build_object('id',vd.doctor_id,'name',du.name,'position',vd.position,'status',vd.status,'started_at',vd.started_at,'completed_at',vd.completed_at) ORDER BY vd.position)
              FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
@@ -502,7 +523,7 @@ router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
     );
     if (!q.rowCount) throw badRequest('Visit cannot be started');
     await client.query(
-      `UPDATE visit_doctors SET status='IN_PROGRESS',started_at=COALESCE(started_at,NOW()),updated_at=NOW()
+      `UPDATE visit_doctors SET status='IN_PROGRESS',started_at=COALESCE(started_at,visit_now($2::bigint)),updated_at=NOW()
        WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3 AND status='WAITING'`,
       [req.user.hospitalId, req.params.id, q.rows[0].doctor_id]
     );
@@ -608,15 +629,15 @@ router.post('/:id/doctor-complete', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyn
     for (const c of data.charges) {
       const resolved = await resolveCharge(client, req.user.hospitalId, c);
       await client.query(
-        `INSERT INTO visit_charges(hospital_id,visit_id,billing_item_id,description,amount,source,added_by,doctor_id,is_locked)
-         VALUES($1,$2,$3,$4,$5,'DOCTOR',$6,$7,TRUE)`,
+        `INSERT INTO visit_charges(hospital_id,visit_id,billing_item_id,description,amount,source,added_by,doctor_id,is_locked,created_at)
+         VALUES($1,$2,$3,$4,$5,'DOCTOR',$6,$7,TRUE,visit_now($2::bigint))`,
         [req.user.hospitalId, req.params.id, resolved.billingItemId, resolved.description, resolved.amount, req.user.id, visit.doctor_id]
       );
     }
 
     await client.query(
       `UPDATE visit_doctors
-       SET status='COMPLETED',doctor_notes=$1,completed_at=NOW(),updated_at=NOW()
+       SET status='COMPLETED',doctor_notes=$1,completed_at=visit_now($3::bigint),updated_at=NOW()
        WHERE hospital_id=$2 AND visit_id=$3 AND doctor_id=$4 AND status IN ('WAITING','IN_PROGRESS')`,
       [visit.doctor_notes, req.user.hospitalId, req.params.id, visit.doctor_id]
     );
@@ -661,8 +682,8 @@ router.post('/:id/doctor-complete', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyn
     );
     const amount = total.rows[0].total;
     const paymentQ = await client.query(
-      `INSERT INTO payments(hospital_id,visit_id,amount,payment_mode,reference_no,accepted_by)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+      `INSERT INTO payments(hospital_id,visit_id,amount,payment_mode,reference_no,accepted_by,paid_at)
+       VALUES($1,$2,$3,$4,$5,$6,visit_now($2::bigint)) RETURNING id`,
       [req.user.hospitalId, req.params.id, amount, data.paymentMode, data.referenceNo || null, req.user.id]
     );
     await recordDoctorSettlements(client, req.user.hospitalId, req.params.id, paymentQ.rows[0].id);
@@ -671,7 +692,7 @@ router.post('/:id/doctor-complete', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyn
       [req.user.hospitalId, req.params.id]
     );
     const v = await client.query(
-      `UPDATE visits SET status='COMPLETED',doctor_billing_finalized=$1,completed_by=$2,completed_at=NOW(),updated_at=NOW()
+      `UPDATE visits SET status='COMPLETED',doctor_billing_finalized=$1,completed_by=$2,completed_at=visit_now($3::bigint),updated_at=NOW()
        WHERE id=$3 AND hospital_id=$4 RETURNING *`,
       [data.charges.length > 0, req.user.id, req.params.id, req.user.hospitalId]
     );
@@ -688,8 +709,8 @@ router.post('/:id/reception-charges', allow('ADMIN','RECEPTIONIST'), asyncHandle
     const resolved = await resolveCharge(client, req.user.hospitalId, c);
     const doctorId = await validateReceptionChargeDoctor(client, req.user.hospitalId, req.params.id, c.doctorId);
     const q = await client.query(
-      `INSERT INTO visit_charges(hospital_id,visit_id,billing_item_id,description,amount,source,added_by,doctor_id,is_locked)
-       VALUES($1,$2,$3,$4,$5,'RECEPTION',$6,$7,FALSE)
+      `INSERT INTO visit_charges(hospital_id,visit_id,billing_item_id,description,amount,source,added_by,doctor_id,is_locked,created_at)
+       VALUES($1,$2,$3,$4,$5,'RECEPTION',$6,$7,FALSE,visit_now($2::bigint))
        RETURNING *`,
       [req.user.hospitalId, req.params.id, resolved.billingItemId, resolved.description, resolved.amount, req.user.id, doctorId]
     );
@@ -733,14 +754,14 @@ router.post('/:id/pay', allow('ADMIN','RECEPTIONIST'), asyncHandler(async (req, 
     );
     const amount = totalQ.rows[0].total;
     const paymentQ = await client.query(
-      `INSERT INTO payments(hospital_id,visit_id,amount,payment_mode,reference_no,accepted_by)
-       VALUES($1,$2,$3,$4,$5,$6) RETURNING id`,
+      `INSERT INTO payments(hospital_id,visit_id,amount,payment_mode,reference_no,accepted_by,paid_at)
+       VALUES($1,$2,$3,$4,$5,$6,visit_now($2::bigint)) RETURNING id`,
       [req.user.hospitalId, req.params.id, amount, data.paymentMode, data.referenceNo || null, req.user.id]
     );
     await recordDoctorSettlements(client, req.user.hospitalId, req.params.id, paymentQ.rows[0].id);
     await client.query(`UPDATE visit_charges SET is_locked=TRUE,updated_at=NOW() WHERE hospital_id=$1 AND visit_id=$2`, [req.user.hospitalId, req.params.id]);
     const v = await client.query(
-      `UPDATE visits SET status='COMPLETED',completed_by=$1,completed_at=NOW(),updated_at=NOW()
+      `UPDATE visits SET status='COMPLETED',completed_by=$1,completed_at=visit_now($2::bigint),updated_at=NOW()
        WHERE id=$2 AND hospital_id=$3 RETURNING *`,
       [req.user.id, req.params.id, req.user.hospitalId]
     );
