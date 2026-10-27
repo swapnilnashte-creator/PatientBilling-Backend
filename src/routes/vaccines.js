@@ -202,7 +202,7 @@ router.post('/patient/:patientId/doses', asyncHandler(async (req, res) => {
     const settings = await readSettings(client, hospitalId);
     if (!settings.enabled) throw badRequest('Vaccination is not switched on for this hospital');
     const patient = await patientBasics(client, hospitalId, req.params.patientId);
-    const visit = (await client.query(`SELECT id,patient_id,status,doctor_id FROM visits WHERE id=$1 AND hospital_id=$2 FOR UPDATE`, [d.visitId, hospitalId])).rows[0];
+    const visit = (await client.query(`SELECT id,patient_id,status,doctor_id,entered_late_at,to_char(created_at AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS visit_day FROM visits WHERE id=$1 AND hospital_id=$2 FOR UPDATE`, [d.visitId, hospitalId])).rows[0];
     if (!visit || Number(visit.patient_id) !== Number(patient.id)) throw badRequest('This visit does not belong to this patient');
     if (req.user.role === 'DOCTOR') {
       if (Number(visit.doctor_id) !== Number(req.user.id)) throw forbidden('This visit is assigned to another doctor');
@@ -211,7 +211,7 @@ router.post('/patient/:patientId/doses', asyncHandler(async (req, res) => {
     const vaccine = (await client.query(`SELECT id,name,price,is_active FROM vaccines WHERE id=$1 AND hospital_id=$2`, [d.vaccineId, hospitalId])).rows[0];
     if (!vaccine || !vaccine.is_active) throw badRequest('This vaccine is not available');
     const today = todayIst();
-    const givenOn = d.givenOn || today;
+    const givenOn = d.givenOn || (visit.entered_late_at ? visit.visit_day : today); // an earlier-dated visit: the dose was given on that day
     if (givenOn > today) throw badRequest('The date given cannot be in the future');
     if (patient.dob && givenOn < patient.dob) throw badRequest('The date given is before the patient was born');
     if (d.expiry && `${d.expiry}-28` < givenOn) throw badRequest('This batch has expired. Check the expiry date.');
@@ -222,7 +222,7 @@ router.post('/patient/:patientId/doses', asyncHandler(async (req, res) => {
     let chargeId = null; let charged = 'NONE';
     if (price > 0 && visit.status === 'PAYMENT_PENDING') {
       const c = await client.query(
-        `INSERT INTO visit_charges(hospital_id,visit_id,billing_item_id,description,amount,source,added_by,doctor_id,is_locked) VALUES($1,$2,NULL,$3,$4,'RECEPTION',$5,NULL,FALSE) RETURNING id`,
+        `INSERT INTO visit_charges(hospital_id,visit_id,billing_item_id,description,amount,source,added_by,doctor_id,is_locked,created_at) VALUES($1,$2,NULL,$3,$4,'RECEPTION',$5,NULL,FALSE,visit_now($2::bigint)) RETURNING id`,
         [hospitalId, visit.id, label, price, req.user.id]);
       chargeId = c.rows[0].id; charged = 'ADDED';
     } else if (price > 0) charged = 'DRAFT'; // before the visit is finished the charge joins the draft bill on the visit page
