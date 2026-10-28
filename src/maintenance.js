@@ -35,7 +35,7 @@ export async function maintenanceRow() {
 }
 
 const upper = (t) => t.replace(/\b(am|pm)\b/g, (x) => x.toUpperCase());
-const fmt = (d) => upper(new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true }));
+const fmt = (d) => upper(new Date(d).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', weekday: 'short', day: '2-digit', month: '2-digit', hour: 'numeric', minute: '2-digit', hour12: true }));
 const day = (d) => new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 const clock = (d) => upper(new Date(d).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour: 'numeric', minute: '2-digit', hour12: true }));
 // "Tue, 21 Oct, 10:00 PM to 11:00 PM" or, over midnight, "Tue, 21 Oct, 10:00 PM to Wed, 22 Oct, 1:00 AM" (India time)

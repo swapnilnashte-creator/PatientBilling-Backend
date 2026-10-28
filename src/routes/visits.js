@@ -299,7 +299,7 @@ router.post('/:id/add-me', allow('DOCTOR'), asyncHandler(async (req, res) => {
       );
       if (open.rowCount) {
         const o = open.rows[0];
-        const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+        const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: '2-digit', year: 'numeric' });
         throw badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`);
       }
       await client.query(
@@ -510,7 +510,7 @@ router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
       if (open.rowCount) {
         const o = open.rows[0];
         // the day the visit was registered (India time), so a visit left open from an earlier day is easy to recognise
-        const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+        const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: '2-digit', year: 'numeric' });
         throw badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`);
       }
     }
