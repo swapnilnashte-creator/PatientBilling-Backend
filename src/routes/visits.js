@@ -239,14 +239,13 @@ router.post('/', allow('ADMIN','RECEPTIONIST','DOCTOR'), asyncHandler(async (req
   }
   if (!doctorIds.length) throw badRequest('Select at least one doctor');
 
-  // an earlier-dated visit: Admin and Reception only, up to 30 days back (today's date is an ordinary visit)
+  // an earlier-dated visit (Admin, Reception, or a Doctor for themselves): up to 30 days back (today's date is an ordinary visit)
   let visitDate = null;
   if (data.visitDate) {
     const t = await pool.query(`SELECT to_char((NOW() AT TIME ZONE 'Asia/Kolkata')::date,'YYYY-MM-DD') AS today, to_char((NOW() AT TIME ZONE 'Asia/Kolkata')::date-30,'YYYY-MM-DD') AS earliest`);
     const { today, earliest } = t.rows[0];
     if (data.visitDate > today) throw badRequest('The visit date cannot be in the future');
     if (data.visitDate < today) {
-      if (!['ADMIN', 'RECEPTIONIST'].includes(req.user.role)) throw forbidden('Only the Admin or Reception can enter a visit with an earlier date');
       if (data.visitDate < earliest) throw badRequest('A visit can be entered up to 30 days back');
       visitDate = data.visitDate;
     }
