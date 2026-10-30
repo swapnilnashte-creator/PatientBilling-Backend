@@ -51,10 +51,10 @@ async function payload(hospitalId) {
     [hospitalId]
   );
   const row = q.rows[0];
-  const vx = await pool.query(`SELECT vaccination_enabled,vaccine_schedule_approved_at,vaccine_schedule_changed_at,(display_token IS NOT NULL) AS display_on,booking_enabled FROM hospitals WHERE id=$1`, [hospitalId]);
+  const vx = await pool.query(`SELECT handwriting_enabled,vaccination_enabled,vaccine_schedule_approved_at,vaccine_schedule_changed_at,(display_token IS NOT NULL) AS display_on,booking_enabled FROM hospitals WHERE id=$1`, [hospitalId]);
   const vr = vx.rows[0];
   const vaccination = { enabled: vr.vaccination_enabled, approved: Boolean(vr.vaccine_schedule_approved_at) && (!vr.vaccine_schedule_changed_at || vr.vaccine_schedule_approved_at >= vr.vaccine_schedule_changed_at) };
-  return { ...toRow(row), vaccination, waitingDisplay: Boolean(vr.display_on), onlineBooking: Boolean(vr.booking_enabled), letterhead: { doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no })), showTimings: row.timings?.show !== false, sessions: sessionsOf(row.timings), weeklyOff: row.weekly_off || [], layout: layoutOf(row.letterhead_layout) } };
+  return { ...toRow(row), vaccination, waitingDisplay: Boolean(vr.display_on), handwriting: Boolean(vr.handwriting_enabled), onlineBooking: Boolean(vr.booking_enabled), letterhead: { doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no })), showTimings: row.timings?.show !== false, sessions: sessionsOf(row.timings), weeklyOff: row.weekly_off || [], layout: layoutOf(row.letterhead_layout) } };
 }
 
 router.get('/', asyncHandler(async (req, res) => {
@@ -136,6 +136,13 @@ router.put('/logo', allow('ADMIN'), asyncHandler(async (req, res) => {
 router.delete('/logo', allow('ADMIN'), asyncHandler(async (req, res) => {
   const q = await pool.query(`UPDATE hospitals SET logo_data=NULL,logo_mime=NULL,logo_updated_at=NULL,updated_at=NOW() WHERE id=$1 RETURNING ${COLS}`, [req.user.hospitalId]);
   res.json(await payload(req.user.hospitalId));
+}));
+
+// Writing by hand with a pen tablet or stylus: off until the Admin turns it on.
+router.put('/handwriting', allow('ADMIN'), asyncHandler(async (req, res) => {
+  const data = z.object({ enabled: z.boolean() }).parse(req.body);
+  await pool.query(`UPDATE hospitals SET handwriting_enabled=$2,updated_at=NOW() WHERE id=$1`, [req.user.hospitalId, data.enabled]);
+  res.json({ enabled: data.enabled });
 }));
 
 router.put('/', allow('ADMIN'), asyncHandler(async (req, res) => {

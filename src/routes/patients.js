@@ -327,6 +327,7 @@ router.get('/:id/history', asyncHandler(async (req, res) => {
                       FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
                       WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id),v.doctor_notes) AS doctor_notes,
             v.left_at,v.left_note,
+            EXISTS(SELECT 1 FROM visit_handwriting hw WHERE hw.hospital_id=v.hospital_id AND hw.visit_id=v.id AND hw.stroke_count>0) AS has_pad,
             COALESCE((SELECT string_agg(du.name,', ' ORDER BY vd.position)
                       FROM visit_doctors vd JOIN users du ON du.id=vd.doctor_id AND du.hospital_id=vd.hospital_id
                       WHERE vd.hospital_id=v.hospital_id AND vd.visit_id=v.id AND vd.status<>'SKIPPED'),u.name) AS doctor_name,

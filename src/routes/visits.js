@@ -430,7 +430,8 @@ router.get('/:id', asyncHandler(async (req, res) => {
   const doctors = await getVisitDoctors(client, req.user.hospitalId, req.params.id);
   const settlement = await getSettlementBreakdown(client, req.user.hospitalId, req.params.id);
   const prescription = await getPrescription(client, req.user.hospitalId, req.params.id);
-  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription });
+  const handwriting = await getHandwriting(client, req.user.hospitalId, req.params.id);
+  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription, handwriting });
 }));
 
 // The most recent earlier prescription for this visit's patient (offered as "copy to this visit").
@@ -494,6 +495,37 @@ router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req
     return getPrescription(client, req.user.hospitalId, visit.id);
   });
   res.json({ prescription: result });
+}));
+
+// Handwriting (pen tablet or stylus): the pen strokes of the consulting doctor for this visit. A stroke is { p: [[x, y, pressure], ...] } on a sheet 1000 units wide.
+async function getHandwriting(client, hospitalId, visitId) {
+  const q = await client.query(`SELECT doctor_id,strokes,updated_at FROM visit_handwriting WHERE hospital_id=$1 AND visit_id=$2 AND stroke_count>0 ORDER BY id`, [hospitalId, visitId]);
+  return q.rows.map(r => ({ doctor_id: r.doctor_id, strokes: r.strokes, updated_at: r.updated_at }));
+}
+// The pad of an earlier visit, fetched when the doctor opens it from Previous visits (the visit list only says whether there is one).
+router.get('/:id/handwriting', allow('ADMIN','DOCTOR'), asyncHandler(async (req, res) => {
+  res.json({ handwriting: await getHandwriting(pool, req.user.hospitalId, z.coerce.number().int().positive().parse(req.params.id)) });
+}));
+const strokeSchema = z.object({ p: z.array(z.tuple([z.number().min(0).max(1000), z.number().min(0).max(4000), z.number().min(0).max(100)])).min(1).max(3000) });
+const MAX_POINTS = 60000;
+
+// Only the consulting doctor writes on the pad: admin and reception can see it, not change it.
+router.put('/:id/handwriting', allow('DOCTOR'), asyncHandler(async (req, res) => {
+  const data = z.object({ strokes: z.array(strokeSchema).max(1500) }).parse(req.body);
+  if (data.strokes.reduce((sum, s) => sum + s.p.length, 0) > MAX_POINTS) throw badRequest('There is too much writing on this page. Start a new line below or clear some of it.');
+  await withTransaction(async (client) => {
+    const on = await client.query(`SELECT handwriting_enabled FROM hospitals WHERE id=$1`, [req.user.hospitalId]);
+    if (!on.rows[0]?.handwriting_enabled) throw badRequest('Writing by hand is not turned on for this hospital');
+    const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
+    if (Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
+    if (!['WITH_DOCTOR','PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT','COMPLETED'].includes(visit.status)) throw badRequest('Handwriting can be added once the patient has started seeing the doctor');
+    await client.query(
+      `INSERT INTO visit_handwriting(hospital_id,visit_id,doctor_id,strokes,stroke_count) VALUES($1,$2,$3,$4::jsonb,$5)
+       ON CONFLICT (hospital_id,visit_id,doctor_id) DO UPDATE SET strokes=EXCLUDED.strokes,stroke_count=EXCLUDED.stroke_count,updated_at=NOW()`,
+      [req.user.hospitalId, visit.id, visit.doctor_id, JSON.stringify(data.strokes), data.strokes.length]
+    );
+  });
+  res.json({ ok: true });
 }));
 
 router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {

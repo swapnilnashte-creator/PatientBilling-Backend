@@ -33,6 +33,7 @@ export async function auth(req, res, next) {
       role: q.rows[0].role,
       name: q.rows[0].name,
       impersonatedBySuperuserId: payload.impersonatedBySuperuserId ? Number(payload.impersonatedBySuperuserId) : null,
+      switchedFromAdminId: payload.fromAdminId ? Number(payload.fromAdminId) : null, // an Admin who moved into this Doctor or Receptionist account with its password
     };
     next();
   } catch (error) {

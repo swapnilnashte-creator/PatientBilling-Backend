@@ -10,6 +10,7 @@ import { ensureDefaultBillingItems } from '../config/defaultBillingItems.js';
 import { mobileSchema } from '../mobile.js';
 import { blockedMessage, currentMaintenance } from '../maintenance.js';
 import { auth } from '../middleware/auth.js';
+import { openSession } from '../supportAccess.js';
 
 const router = Router();
 
@@ -73,13 +74,14 @@ const firmSelectionSchema = z.object({
 });
 
 const switchRoleSchema = z.object({
-  role: z.enum(['ADMIN', 'DOCTOR', 'RECEPTIONIST']),
-  password: z.string().min(1),
-});
+  role: z.enum(['ADMIN', 'DOCTOR', 'RECEPTIONIST']).optional(), // the same person's other role
+  userId: z.coerce.number().int().positive().optional(),      // or a chosen account (an Admin choosing a Doctor or Receptionist)
+  password: z.string().optional(), // not needed in a support session
+}).refine(d => d.role || d.userId, { message: 'Choose who to switch to' });
 
-function sessionFor(user) {
+function sessionFor(user, fromAdminId = null) {
   const token = jwt.sign(
-    { hospitalId: user.hospital_id, role: user.role, name: user.name },
+    { hospitalId: user.hospital_id, role: user.role, name: user.name, ...(fromAdminId ? { fromAdminId: Number(fromAdminId) } : {}) },
     process.env.JWT_SECRET,
     { subject: String(user.id), expiresIn: process.env.JWT_EXPIRES_IN || '12h' }
   );
@@ -161,16 +163,38 @@ router.post('/select-firm', asyncHandler(async (req, res) => {
   res.json(sessionFor(q.rows[0]));
 }));
 
-// The same person's other role in this hospital (for example Admin who is also the Doctor): sign in as that role without leaving.
-// The password is asked again, so a Doctor's session alone can never turn into an Admin's.
+// Moving to another account of this hospital without leaving, always with that account's own password:
+//  - the same person's other role (Admin who is also the Doctor: same mobile), and
+//  - for an Admin, any Doctor or Receptionist of the hospital, chosen from a list. The session then remembers which Admin it came from (fromAdminId, signed into the
+//    token), so the list also offers a way back to that Admin, again with the Admin's password.
+// A plain Doctor or Receptionist session never sees anyone else's name.
+async function switchTargets(user) {
+  const rows = new Map();
+  const add = (r) => { if (Number(r.id) !== Number(user.id) && !rows.has(Number(r.id))) rows.set(Number(r.id), r); };
+  const cols = `o.id,o.hospital_id,o.name,o.mobile,o.email,o.password_hash,o.role,o.speciality,h.name AS hospital_name`;
+  const base = `FROM users o JOIN hospitals h ON h.id=o.hospital_id WHERE o.hospital_id=$1 AND o.is_active=TRUE AND o.deleted_at IS NULL AND h.is_active=TRUE`;
+  const mine = await pool.query(`SELECT mobile FROM users WHERE id=$1`, [user.id]);
+  (await pool.query(`SELECT ${cols} ${base} AND o.mobile=$2`, [user.hospitalId, mine.rows[0]?.mobile])).rows.forEach(r => add({ ...r, sameMobile: true }));
+  // a support session (the hospital gave a support code) can move to anyone in that hospital, as the Super Admin panel's sign-in already could
+  if (user.impersonatedBySuperuserId) {
+    (await pool.query(`SELECT ${cols} ${base} ORDER BY o.role,lower(o.name)`, [user.hospitalId])).rows.forEach(add);
+    return { rows: [...rows.values()], fromAdminId: null };
+  }
+  let fromAdminId = null;
+  if (user.role === 'ADMIN') fromAdminId = Number(user.id);
+  else if (user.switchedFromAdminId) {
+    const adm = await pool.query(`SELECT ${cols} ${base} AND o.id=$2 AND o.role='ADMIN'`, [user.hospitalId, user.switchedFromAdminId]);
+    if (adm.rowCount) { fromAdminId = Number(adm.rows[0].id); add(adm.rows[0]); }
+  }
+  if (fromAdminId) (await pool.query(`SELECT ${cols} ${base} AND o.role IN ('DOCTOR','RECEPTIONIST') ORDER BY o.role,lower(o.name)`, [user.hospitalId])).rows.forEach(add);
+  return { rows: [...rows.values()], fromAdminId };
+}
+
 router.get('/my-roles', auth, asyncHandler(async (req, res) => {
-  if (!req.user.hospitalId || req.user.impersonatedBySuperuserId) return res.json({ roles: [] });
-  const q = await pool.query(
-    `SELECT o.role FROM users me JOIN users o ON o.hospital_id=me.hospital_id AND o.mobile=me.mobile AND o.id<>me.id
-     WHERE me.id=$1 AND o.is_active=TRUE AND o.deleted_at IS NULL ORDER BY o.role`,
-    [req.user.id]
-  );
-  res.json({ roles: q.rows.map(r => r.role) });
+  if (!req.user.hospitalId) return res.json({ roles: [], accounts: [] });
+  const { rows } = await switchTargets(req.user);
+  const ranked = rows.sort((x, y) => ['ADMIN', 'DOCTOR', 'RECEPTIONIST'].indexOf(x.role) - ['ADMIN', 'DOCTOR', 'RECEPTIONIST'].indexOf(y.role) || x.name.localeCompare(y.name));
+  res.json({ roles: [...new Set(ranked.map(r => r.role))], accounts: ranked.map(r => ({ id: Number(r.id), name: r.name, role: r.role })) });
 }));
 
 // wrong passwords are counted against the signed-in person's mobile, like a sign-in
@@ -180,19 +204,29 @@ const withOwnMobile = asyncHandler(async (req, _res, next) => {
   next();
 });
 
+// Inside a support session the new sign-in stays inside it: same Super Admin, same end time, and it is written to the hospital's support history and the platform audit log.
+async function supportSwitch(req, target) {
+  const session = await openSession(pool, target.hospital_id);
+  if (!session || Number(session.superuser_id) !== Number(req.user.impersonatedBySuperuserId)) throw badRequest('The support session has ended');
+  const exp = jwt.decode(req.headers.authorization.split(' ')[1])?.exp;
+  const seconds = Math.max(60, Math.floor((exp * 1000 - Date.now()) / 1000));
+  const token = jwt.sign({ hospitalId: target.hospital_id, role: target.role, name: target.name, impersonatedBySuperuserId: req.user.impersonatedBySuperuserId }, process.env.JWT_SECRET, { subject: String(target.id), expiresIn: seconds });
+  await pool.query(`INSERT INTO support_access_events(support_id,hospital_id,action,target_user_id,target_name,target_role) VALUES($1,$2,'SIGN_IN_AS',$3,$4,$5)`, [session.id, target.hospital_id, target.id, target.name, target.role]);
+  await pool.query(`INSERT INTO super_admin_audit_logs(superuser_id,action,hospital_id,target_user_id,metadata) VALUES($1,$2,$3,$4,$5)`, [req.user.impersonatedBySuperuserId, target.role === 'ADMIN' ? 'IMPERSONATE_ADMIN' : 'IMPERSONATE_USER', target.hospital_id, target.id, JSON.stringify({ role: target.role, name: target.name, mobile: target.mobile, switchedInSession: true })]);
+  const su = await pool.query(`SELECT name FROM platform_superusers WHERE id=$1`, [req.user.impersonatedBySuperuserId]);
+  return { token, user: { id: Number(target.id), hospitalId: Number(target.hospital_id), name: target.name, mobile: target.mobile, email: target.email, role: target.role, hospitalName: target.hospital_name, speciality: target.speciality || null, impersonatedBy: { superuserId: req.user.impersonatedBySuperuserId, superuserName: su.rows[0]?.name || '' } } };
+}
+
 router.post('/switch-role', auth, withOwnMobile, loginGuard, asyncHandler(async (req, res) => {
   const data = switchRoleSchema.parse(req.body);
-  if (!req.user.hospitalId || req.user.impersonatedBySuperuserId) throw badRequest('Switching roles is not available in this session');
-  const q = await pool.query(
-    `SELECT o.id,o.hospital_id,o.name,o.mobile,o.email,o.password_hash,o.role,o.speciality,h.name AS hospital_name
-     FROM users me JOIN users o ON o.hospital_id=me.hospital_id AND o.mobile=me.mobile
-     JOIN hospitals h ON h.id=o.hospital_id
-     WHERE me.id=$1 AND o.role=$2 AND o.id<>me.id AND o.is_active=TRUE AND o.deleted_at IS NULL AND h.is_active=TRUE`,
-    [req.user.id, data.role]
-  );
-  if (!q.rowCount) throw badRequest('You do not have that role in this hospital');
-  if (!(await bcrypt.compare(data.password, q.rows[0].password_hash))) { res.locals.loginFailed = true; throw badRequest(`Wrong password for the ${data.role.toLowerCase()} account`); }
-  res.json(sessionFor(q.rows[0]));
+  if (!req.user.hospitalId) throw badRequest('Switching accounts is not available in this session');
+  const { rows, fromAdminId } = await switchTargets(req.user);
+  const target = data.userId ? rows.find(r => Number(r.id) === data.userId) : rows.find(r => r.role === data.role && r.sameMobile);
+  if (!target) throw badRequest(data.userId ? 'You cannot switch to that account' : 'You do not have that role in this hospital');
+  if (req.user.impersonatedBySuperuserId) return res.json(await supportSwitch(req, target));
+  if (!data.password) throw badRequest('Enter the password');
+  if (!(await bcrypt.compare(data.password, target.password_hash))) { res.locals.loginFailed = true; throw badRequest(`Wrong password for ${target.name} (${target.role.toLowerCase()})`); }
+  res.json(sessionFor(target, target.role === 'ADMIN' ? null : fromAdminId));
 }));
 
 export default router;
