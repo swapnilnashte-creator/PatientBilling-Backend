@@ -4,13 +4,14 @@ import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, forbidden, money, notFound } from '../utils.js';
 import { recordPrescriptionChanges } from '../prescriptionAudit.js';
+import { dietPackageForVisit, syncVisitWeight } from './diet.js';
 
 const router = Router();
 
 async function getVisit(client, hospitalId, visitId, lock = false) {
   const q = await client.query(
     `SELECT v.*, p.full_name,p.mobile,p.whatsapp_mobile,p.gender,p.date_of_birth,p.dob_estimated,p.address,p.qr_code AS patient_qr_code,p.allergy_status,(SELECT json_agg(al.name ORDER BY al.id) FROM patient_allergies al WHERE al.hospital_id=p.hospital_id AND al.patient_id=p.id) AS allergy_names,
-            d.name AS doctor_name,d.qualification AS doctor_qualification,d.registration_no AS doctor_registration_no
+            d.name AS doctor_name,d.qualification AS doctor_qualification,d.registration_no AS doctor_registration_no,d.speciality AS doctor_speciality
      FROM visits v
      JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
      JOIN users d ON d.id=v.doctor_id AND d.hospital_id=v.hospital_id
@@ -292,14 +293,14 @@ router.post('/:id/add-me', allow('DOCTOR'), asyncHandler(async (req, res) => {
     if (visit.status === 'PAYMENT_PENDING') {
       // the doctor starts now, so the same one-at-a-time rule as starting a visit applies
       const open = await client.query(
-        `SELECT v.created_at,v.daily_number,p.full_name FROM visits v JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
+        `SELECT v.id,v.created_at,v.daily_number,p.full_name FROM visits v JOIN patients p ON p.id=v.patient_id AND p.hospital_id=v.hospital_id
          WHERE v.hospital_id=$1 AND v.doctor_id=$2 AND v.status='WITH_DOCTOR' ORDER BY v.updated_at LIMIT 1`,
         [req.user.hospitalId, req.user.id]
       );
       if (open.rowCount) {
         const o = open.rows[0];
         const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: '2-digit', year: 'numeric' });
-        throw badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`);
+        throw Object.assign(badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`), { busyVisit: { id: Number(o.id), name: o.full_name } });
       }
       await client.query(
         `INSERT INTO visit_doctors(hospital_id,visit_id,doctor_id,position,status,started_at,self_added,added_by)
@@ -431,7 +432,8 @@ router.get('/:id', asyncHandler(async (req, res) => {
   const settlement = await getSettlementBreakdown(client, req.user.hospitalId, req.params.id);
   const prescription = await getPrescription(client, req.user.hospitalId, req.params.id);
   const handwriting = await getHandwriting(client, req.user.hospitalId, req.params.id);
-  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription, handwriting });
+  const dietPackage = await dietPackageForVisit(client, req.user.hospitalId, visit);
+  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription, handwriting, dietPackage });
 }));
 
 // The most recent earlier prescription for this visit's patient (offered as "copy to this visit").
@@ -542,7 +544,7 @@ router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
         const o = open.rows[0];
         // the day the visit was registered (India time), so a visit left open from an earlier day is easy to recognise
         const day = new Date(o.created_at).toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: '2-digit', year: 'numeric' });
-        throw badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`);
+        throw Object.assign(badRequest(`Complete the visit of ${o.full_name} (visit of ${day}${o.daily_number ? `, token ${o.daily_number}` : ''}) first. A new visit can be started only after the one in progress is completed or sent to reception.`), { busyVisit: { id: Number(o.id), name: o.full_name } });
       }
     }
     const q = await client.query(
@@ -575,6 +577,7 @@ router.put('/:id/vitals', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(a
        WHERE id=$1 AND hospital_id=$2 RETURNING ${VITALS_COLUMNS}`,
       [req.params.id, req.user.hospitalId, ...vitalsParams(data)]
     );
+    if (data.weightKg) await syncVisitWeight(client, { hospitalId: req.user.hospitalId, patientId: visit.patient_id, visitId: visit.id, weightKg: data.weightKg, user: req.user });
     return q.rows[0];
   });
   res.json(result);

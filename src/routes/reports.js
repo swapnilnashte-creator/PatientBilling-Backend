@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../db.js';
 import { allow } from '../middleware/auth.js';
+import { hospitalHasDietitian } from './diet.js';
 import { asyncHandler, badRequest } from '../utils.js';
 
 const router = Router();
@@ -49,6 +50,26 @@ router.get('/doctors/:doctorId/visits', asyncHandler(async (req, res) => {
   res.json({ doctor: doctorQ.rows[0], visits: q.rows, range: { dateFrom, dateTo, allTime } });
 }));
 
+// A dietitian's own diet package instalments received in the dates (they count on the day received, next to the visit income of the same page)
+router.get('/doctors/:doctorId/packages', asyncHandler(async (req, res) => {
+  const allTime = String(req.query.allTime || '') === '1';
+  const today = new Date().toISOString().slice(0, 10);
+  const dateFrom = allTime ? null : z.string().date().parse(String(req.query.dateFrom || today));
+  const dateTo = allTime ? null : z.string().date().parse(String(req.query.dateTo || today));
+  const doctorId = z.coerce.number().int().positive().parse(req.params.doctorId);
+  if (dateFrom && dateTo && dateFrom > dateTo) throw badRequest('From date cannot be after To date');
+  if (req.user.role === 'DOCTOR' && doctorId !== Number(req.user.id)) return res.status(403).json({ message: 'You can only see your own report' });
+  const q = await pool.query(
+    `SELECT x.id,to_char(x.paid_on,'YYYY-MM-DD') AS paid_on,x.amount,x.payment_mode,k.name AS package_name,p.id AS patient_id,p.full_name,p.mobile
+     FROM diet_package_payments x
+     JOIN diet_packages k ON k.id=x.package_id AND k.hospital_id=x.hospital_id
+     JOIN patients p ON p.id=k.patient_id AND p.hospital_id=k.hospital_id
+     WHERE x.hospital_id=$1 AND k.doctor_id=$2 AND ($3::date IS NULL OR x.paid_on>=$3::date) AND ($4::date IS NULL OR x.paid_on<=$4::date)
+     ORDER BY x.paid_on DESC,x.id DESC`,
+    [req.user.hospitalId, doctorId, dateFrom, dateTo]);
+  res.json({ payments: q.rows });
+}));
+
 router.get('/', staff, asyncHandler(async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const allTime = String(req.query.allTime || '') === '1';
@@ -56,6 +77,7 @@ router.get('/', staff, asyncHandler(async (req, res) => {
   const dateTo = allTime ? null : z.string().date().parse(String(req.query.dateTo || today));
   if (dateFrom && dateTo && dateFrom > dateTo) throw badRequest('From date cannot be after To date');
   const params = [req.user.hospitalId, dateFrom, dateTo];
+  const dietOff = (await hospitalHasDietitian(pool, req.user.hospitalId)) ? '' : ' AND FALSE'; // no dietitian: no diet package money in the figures
   const inRange = column => `($2::date IS NULL OR ${column} >= $2::date) AND ($3::date IS NULL OR ${column} < $3::date + INTERVAL '1 day')`;
 
   const [summaryQ, doctorsQ, incomeQ, modesQ, patientsQ, statusesQ] = await Promise.all([
@@ -68,6 +90,8 @@ router.get('/', staff, asyncHandler(async (req, res) => {
         (SELECT COUNT(*)::int FROM visit_doctors vd WHERE vd.hospital_id=$1 AND vd.status='COMPLETED' AND ${inRange('vd.completed_at')}) AS consultations,
         (SELECT COALESCE(SUM(p.amount),0)::numeric(14,2) FROM payments p WHERE p.hospital_id=$1 AND ${inRange('p.paid_at')}) AS income,
         (SELECT COALESCE(AVG(p.amount),0)::numeric(14,2) FROM payments p WHERE p.hospital_id=$1 AND ${inRange('p.paid_at')}) AS average_payment,
+        (SELECT COALESCE(SUM(x.amount),0)::numeric(14,2) FROM diet_package_payments x WHERE x.hospital_id=$1${dietOff} AND ${inRange('x.paid_on')}) AS package_income,
+        (SELECT COUNT(*)::int FROM diet_package_payments x WHERE x.hospital_id=$1${dietOff} AND ${inRange('x.paid_on')}) AS package_payments,
         (SELECT COALESCE(SUM(vc.amount),0)::numeric(14,2)
          FROM visits v JOIN visit_charges vc ON vc.hospital_id=v.hospital_id AND vc.visit_id=v.id
          WHERE v.hospital_id=$1 AND v.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT') AND ${inRange('v.created_at')}) AS outstanding,
@@ -119,9 +143,11 @@ router.get('/', staff, asyncHandler(async (req, res) => {
               (${inRange('p.created_at')}) AS is_new,
               (ARRAY_AGG(s.visit_number ORDER BY s.created_at DESC))[1] AS last_visit_number,
               MAX(s.created_at) AS last_visit_at,
-              COALESCE(SUM(ct.amount),0)::numeric(14,2) AS billed_amount,
-              COALESCE(SUM(pt.amount),0)::numeric(14,2) AS paid_amount,
-              COALESCE(SUM(ct.amount) FILTER (WHERE s.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)::numeric(14,2) AS outstanding_amount
+              (COALESCE(SUM(ct.amount),0)+(SELECT COALESCE(SUM(k.amount),0) FROM diet_packages k WHERE k.hospital_id=$1 AND k.patient_id=p.id AND k.status='ACTIVE'${dietOff}))::numeric(14,2) AS billed_amount,
+              (COALESCE(SUM(pt.amount),0)+(SELECT COALESCE(SUM(x.amount),0) FROM diet_package_payments x JOIN diet_packages k ON k.id=x.package_id AND k.hospital_id=x.hospital_id WHERE k.hospital_id=$1 AND k.patient_id=p.id AND k.status='ACTIVE'${dietOff}))::numeric(14,2) AS paid_amount,
+              (COALESCE(SUM(ct.amount) FILTER (WHERE s.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)+(SELECT COALESCE(SUM(k.amount),0) FROM diet_packages k WHERE k.hospital_id=$1 AND k.patient_id=p.id AND k.status='ACTIVE'${dietOff})-(SELECT COALESCE(SUM(x.amount),0) FROM diet_package_payments x JOIN diet_packages k ON k.id=x.package_id AND k.hospital_id=x.hospital_id WHERE k.hospital_id=$1 AND k.patient_id=p.id AND k.status='ACTIVE'${dietOff}))::numeric(14,2) AS outstanding_amount,
+              COALESCE((SELECT SUM(x.amount) FROM diet_package_payments x JOIN diet_packages k ON k.id=x.package_id AND k.hospital_id=x.hospital_id WHERE k.hospital_id=$1 AND k.patient_id=p.id AND k.status='ACTIVE'${dietOff}),0)::numeric(14,2) AS package_received,
+              COALESCE((SELECT SUM(k.amount) FROM diet_packages k WHERE k.hospital_id=$1 AND k.patient_id=p.id AND k.status='ACTIVE'${dietOff}),0)::numeric(14,2) AS package_fee
        FROM scoped s JOIN patients p ON p.id=s.patient_id AND p.hospital_id=$1
        LEFT JOIN charge_totals ct ON ct.visit_id=s.id
        LEFT JOIN payment_totals pt ON pt.visit_id=s.id

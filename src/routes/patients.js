@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { hospitalHasDietitian, patientPackages } from './diet.js';
 import { z } from 'zod';
 import { pool } from '../db.js';
 import { asyncHandler, badRequest, notFound } from '../utils.js';
@@ -83,15 +84,23 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
   // unless the list is sorted or filtered by one of them. Doing them for every patient first made big hospitals take many seconds.
   const heavyFirst = owes || ['visits', 'owes'].includes(String(req.query.sort || ''));
   const totalVisitsSql = (a) => `(SELECT COUNT(*)::int FROM visits a WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status<>'CANCELLED') AS total_visits`;
-  const outstandingSql = (a) => `COALESCE((SELECT SUM(vc.amount) FROM visit_charges vc JOIN visits a ON a.id=vc.visit_id AND a.hospital_id=vc.hospital_id
-                        WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)::numeric(12,2) AS outstanding`;
+  // diet package money counts only while the hospital has a dietitian
+  const dietOn = await hospitalHasDietitian(pool, req.user.hospitalId);
+  const pkgDoctor = isDoctor ? ` AND k.doctor_id=$${doctorParam}` : '';
+  const pkJoin = dietOn ? `LEFT JOIN (SELECT k.patient_id,SUM(k.amount) AS fee,COALESCE(SUM(pp.paid),0) AS paid FROM diet_packages k
+                  LEFT JOIN (SELECT package_id,SUM(amount) AS paid FROM diet_package_payments WHERE hospital_id=$1 GROUP BY package_id) pp ON pp.package_id=k.id
+                  WHERE k.hospital_id=$1 AND k.status='ACTIVE'${pkgDoctor} GROUP BY k.patient_id) pk ON pk.patient_id=p.id` : `LEFT JOIN (SELECT NULL::bigint AS patient_id,0::numeric AS fee,0::numeric AS paid WHERE FALSE) pk ON pk.patient_id=p.id`;
+  const outstandingSql = (a, fee, paid) => `(COALESCE((SELECT SUM(vc.amount) FROM visit_charges vc JOIN visits a ON a.id=vc.visit_id AND a.hospital_id=vc.hospital_id
+                        WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status IN ('PAYMENT_PENDING','LEFT_WITHOUT_PAYMENT')),0)${isDoctor ? '' : ` + ${fee} - ${paid}`})::numeric(12,2) AS outstanding`;
   const q = await pool.query(
     `WITH base AS (
        SELECT p.hospital_id,p.id,p.full_name,p.mobile,p.whatsapp_mobile,p.gender,p.date_of_birth,p.dob_estimated,COALESCE(s.visits,0)::int AS visits,s.last_visit_at,
-              COALESCE(s.billed,0)::numeric(12,2) AS billed,COALESCE(s.paid,0)::numeric(12,2) AS paid${heavyFirst ? `,
+              (COALESCE(s.billed,0)${isDoctor ? '' : '+COALESCE(pk.fee,0)'})::numeric(12,2) AS billed,(COALESCE(s.paid,0)${isDoctor ? '' : '+COALESCE(pk.paid,0)'})::numeric(12,2) AS paid,
+              COALESCE(pk.fee,0)::numeric(12,2) AS package_fee,COALESCE(pk.paid,0)::numeric(12,2) AS package_paid${heavyFirst ? `,
               ${totalVisitsSql('p')},
-              ${outstandingSql('p')}` : ''}
+              ${outstandingSql('p', 'COALESCE(pk.fee,0)', 'COALESCE(pk.paid,0)')}` : ''}
        FROM patients p
+       ${pkJoin}
        LEFT JOIN (
          SELECT v.patient_id,COUNT(*)::int AS visits,MAX(v.created_at) AS last_visit_at,
                 SUM((SELECT COALESCE(SUM(vc.amount),0) FROM visit_charges vc WHERE vc.hospital_id=v.hospital_id AND vc.visit_id=v.id)) AS billed,
@@ -109,7 +118,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
      )
      SELECT t.*${heavyFirst ? '' : `,
             ${totalVisitsSql('t')},
-            ${outstandingSql('t')}`},
+            ${outstandingSql('t', 't.package_fee', 't.package_paid')}`},
             ${isDoctor ? `(SELECT left(translate(vd.doctor_notes, chr(10) || chr(13) || chr(9), '   '), 120) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
               WHERE a.hospital_id=t.hospital_id AND a.patient_id=t.id AND vd.doctor_id=$${doctorParam} AND COALESCE(btrim(vd.doctor_notes),'')<>'' ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::text'} AS last_finding,
             ${isDoctor ? `(SELECT json_build_object('days', vd.follow_up_days, 'visitOn', to_char(a.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD'), 'visitId', a.id) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
@@ -291,7 +300,12 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
     summary.paid = Math.round(counted.reduce((n, v) => n + (v.bill.payment ? v.bill.payment.amount : 0), 0) * 100) / 100;
     summary.outstanding = Math.round(counted.filter(v => v.bill.unpaid).reduce((n, v) => n + v.bill.total, 0) * 100) / 100;
   }
-  res.json({ patient: patientQ.rows[0], summary, visits: out, access: { clinical, money } });
+  // diet packages: what the client agreed, what was received and what is left (a doctor sees only their own)
+  const dietPackages = await patientPackages(pool, hospitalId, id, role === 'DOCTOR' ? req.user.id : null);
+  // for Admin and reception the package is part of Billed, Paid and Owes; summary.package keeps it apart for a doctor, who sees no visit money
+  if (dietPackages.length && money) { const fee = dietPackages.reduce((n, k) => n + k.amount, 0), got = dietPackages.reduce((n, k) => n + k.paid, 0); summary.billed = Math.round((summary.billed + fee) * 100) / 100; summary.paid = Math.round((summary.paid + got) * 100) / 100; summary.outstanding = Math.round((summary.outstanding + fee - got) * 100) / 100; }
+  if (dietPackages.length) summary.package = { fee: dietPackages.reduce((n, k) => n + k.amount, 0), received: dietPackages.reduce((n, k) => n + k.paid, 0), left: dietPackages.reduce((n, k) => n + k.balance, 0) };
+  res.json({ patient: patientQ.rows[0], summary, visits: out, dietPackages, access: { clinical, money } });
 }));
 
 // Every change to this patient's prescriptions (medicine added, removed, or its details changed), newest visit first, oldest change first inside a visit.

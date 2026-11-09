@@ -53,8 +53,9 @@ async function payload(hospitalId) {
   const row = q.rows[0];
   const vx = await pool.query(`SELECT handwriting_enabled,vaccination_enabled,vaccine_schedule_approved_at,vaccine_schedule_changed_at,(display_token IS NOT NULL) AS display_on,booking_enabled FROM hospitals WHERE id=$1`, [hospitalId]);
   const vr = vx.rows[0];
+  const dt = await pool.query(`SELECT 1 FROM users WHERE hospital_id=$1 AND role='DOCTOR' AND speciality='DIETITIAN' AND is_active=TRUE AND deleted_at IS NULL LIMIT 1`, [hospitalId]);
   const vaccination = { enabled: vr.vaccination_enabled, approved: Boolean(vr.vaccine_schedule_approved_at) && (!vr.vaccine_schedule_changed_at || vr.vaccine_schedule_approved_at >= vr.vaccine_schedule_changed_at) };
-  return { ...toRow(row), vaccination, waitingDisplay: Boolean(vr.display_on), handwriting: Boolean(vr.handwriting_enabled), onlineBooking: Boolean(vr.booking_enabled), letterhead: { doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no })), showTimings: row.timings?.show !== false, sessions: sessionsOf(row.timings), weeklyOff: row.weekly_off || [], layout: layoutOf(row.letterhead_layout) } };
+  return { ...toRow(row), vaccination, waitingDisplay: Boolean(vr.display_on), handwriting: Boolean(vr.handwriting_enabled), hasDietitian: dt.rowCount > 0, onlineBooking: Boolean(vr.booking_enabled), letterhead: { doctors: docs.rows.map(d => ({ id: d.id, name: d.name, qualification: d.qualification, registrationNo: d.registration_no })), showTimings: row.timings?.show !== false, sessions: sessionsOf(row.timings), weeklyOff: row.weekly_off || [], layout: layoutOf(row.letterhead_layout) } };
 }
 
 router.get('/', asyncHandler(async (req, res) => {

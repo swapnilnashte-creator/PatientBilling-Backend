@@ -7,8 +7,8 @@ import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { mobileSchema } from '../mobile.js';
 import { autoTopUp, deactivationImpact, doctorImpact, refreshOpenMonthlyInvoice } from '../billing/doctors.js';
 
-// Only these two are offered for now (the others come back by adding them here and in frontend/src/speciality.js).
-export const SPECIALITIES = ['GENERAL_PHYSICIAN', 'PAEDIATRICIAN'];
+// Only these are offered for now (the others come back by adding them here and in frontend/src/speciality.js).
+export const SPECIALITIES = ['GENERAL_PHYSICIAN', 'PAEDIATRICIAN', 'DIETITIAN'];
 const router = Router();
 router.use(allow('ADMIN'));
 
@@ -34,7 +34,7 @@ const userSchema = z.object({
   role: z.enum(['ADMIN','DOCTOR','RECEPTIONIST']),
   qualification: z.string().trim().max(160).optional().default(''),
   registrationNo: z.string().trim().max(40).optional().default(''),
-  speciality: z.enum(SPECIALITIES).nullable().optional().default(null),
+  speciality: z.preprocess(v => (v === '' ? null : v), z.enum(SPECIALITIES).nullable().optional().default(null)), // only a doctor has one; a blank means none
   acknowledgeBilling: z.boolean().optional().default(false),
 });
 

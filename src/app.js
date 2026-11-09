@@ -21,6 +21,7 @@ import reportRoutes from './routes/reports.js';
 import medicineRoutes from './routes/medicines.js';
 import expenseRoutes from './routes/expenses.js';
 import certificateRoutes from './routes/certificates.js';
+import dietRoutes from './routes/diet.js';
 import findingTemplateRoutes from './routes/findingTemplates.js';
 import subscriptionRoutes from './routes/subscription.js';
 import superAdminRoutes from './routes/superAdmin.js';
@@ -30,6 +31,7 @@ import supportAccessRoutes from './routes/supportAccess.js';
 import { auth } from './middleware/auth.js';
 import { proxyWatch, startupProxyNotes, trustProxySetting } from './proxyCheck.js';
 import { currentMaintenance, maintenanceGate } from './maintenance.js';
+import { friendlyZod } from './validationMessages.js';
 
 const app = express();
 // behind a reverse proxy (nginx, Cloudflare) set TRUST_PROXY=1 so each visitor's own address is seen, not the proxy's
@@ -92,17 +94,18 @@ app.use('/api/reports', auth, reportRoutes);
 app.use('/api/medicines', auth, medicineRoutes);
 app.use('/api/expenses', auth, expenseRoutes);
 app.use('/api/certificates', auth, certificateRoutes);
+app.use('/api/diet', auth, dietRoutes);
 app.use('/api/finding-templates', auth, findingTemplateRoutes);
 app.use('/api/subscription', auth, subscriptionRoutes);
 app.use('/api/super-admin', auth, superAdminRoutes);
 
 app.use((err, req, res, _next) => {
-  if (err?.name === 'ZodError') return res.status(400).json({ message: err.issues?.[0]?.message || 'Invalid input', details: err.issues });
+  if (err?.name === 'ZodError') return res.status(400).json({ message: friendlyZod(err), details: err.issues });
   if (err?.code === '23505') return res.status(409).json({ message: 'This record already exists' });
   const status = err.status || 500;
   // expected problems (wrong password, not found, not allowed) carry their own message; anything unexpected is written to the
   // daily error log and the person sees a short reference to quote instead of internal details
-  if (status < 500) return res.status(status).json({ message: err.message || 'Request failed', ...(err.needDetails ? { needDetails: true } : {}), ...(err.duplicate ? { duplicate: true } : {}), ...(err.openVisit ? { openVisit: err.openVisit } : {}), ...(err.needCode ? { needCode: true } : {}), ...(err.attemptsLeft !== undefined ? { attemptsLeft: err.attemptsLeft } : {}) });
+  if (status < 500) return res.status(status).json({ message: err.message || 'Request failed', ...(err.needDetails ? { needDetails: true } : {}), ...(err.duplicate ? { duplicate: true } : {}), ...(err.openVisit ? { openVisit: err.openVisit } : {}), ...(err.busyVisit ? { busyVisit: err.busyVisit } : {}), ...(err.needCode ? { needCode: true } : {}), ...(err.needConfirm ? { needConfirm: true } : {}), ...(err.attemptsLeft !== undefined ? { attemptsLeft: err.attemptsLeft } : {}) });
   console.error(err);
   const ref = logError(err, { method: req.method, url: req.originalUrl, status, user: req.user ? `${req.user.role} ${req.user.id}${req.user.hospitalId ? ` (hospital ${req.user.hospitalId})` : ''}` : '' });
   res.status(status).json({ message: `Something went wrong on our side. Please try again. If it keeps happening, tell support this reference: ${ref}`, ref });
