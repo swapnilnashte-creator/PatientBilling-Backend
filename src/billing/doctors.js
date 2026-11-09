@@ -5,6 +5,13 @@ import { addDays, buildQuote, buildTopUp, currentPeriodStart, cycleMonths, perio
 //  - annualCap / doctorImpact / autoTopUp: annual clinics adding doctors beyond what the year was billed for
 
 const IST = `'Asia/Kolkata'`;
+
+// Doctors with these specialities are not charged while their module is in Beta (the Dietitian module). They are left out of every per-doctor count below,
+// and of the doctor counts the invoices are made from. Remove a speciality from this list when its module is released and it is charged like any doctor.
+export const FREE_SPECIALITIES = ['DIETITIAN'];
+export const isFreeSpeciality = (speciality) => FREE_SPECIALITIES.includes(speciality);
+/** SQL condition for a users row (alias a) that IS charged: a doctor whose speciality is not free. */
+export const chargedSql = (a = 'u') => `(${a}.speciality IS NULL OR ${a}.speciality NOT IN (${FREE_SPECIALITIES.map(s => `'${s}'`).join(',')}))`;
 const num = (v) => (v === null || v === undefined ? null : Number(v));
 
 async function plansOf(client) {
@@ -21,7 +28,7 @@ export async function billableDoctors(client, hospitalId, periodStart, periodEnd
             COALESCE((SELECT e.active FROM doctor_status_events e WHERE e.user_id=u.id AND (e.at AT TIME ZONE ${IST})::date <= $4::date ORDER BY e.at DESC,e.id DESC LIMIT 1),FALSE) AS active_at_end,
             EXISTS (SELECT 1 FROM visit_doctors vd WHERE vd.hospital_id=u.hospital_id AND vd.doctor_id=u.id AND vd.status='COMPLETED'
                       AND (vd.completed_at AT TIME ZONE ${IST})::date BETWEEN $2::date AND $3::date) AS consulted
-     FROM users u WHERE u.hospital_id=$1 AND u.role='DOCTOR' ORDER BY u.name`,
+     FROM users u WHERE u.hospital_id=$1 AND u.role='DOCTOR' AND ${chargedSql('u')} ORDER BY u.name`,
     [hospitalId, periodStart, periodEnd, asOf]
   );
   const counted = q.rows.filter(r => r.active_at_end || r.consulted);
@@ -34,7 +41,7 @@ export async function billableDoctors(client, hospitalId, periodStart, periodEnd
 }
 
 const activeCount = async (client, hospitalId) =>
-  Number((await client.query(`SELECT COUNT(*)::int AS n FROM users WHERE hospital_id=$1 AND role='DOCTOR' AND is_active=TRUE AND deleted_at IS NULL`, [hospitalId])).rows[0].n);
+  Number((await client.query(`SELECT COUNT(*)::int AS n FROM users u WHERE u.hospital_id=$1 AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL AND ${chargedSql('u')}`, [hospitalId])).rows[0].n);
 
 async function hospitalFor(client, hospitalId, lock = false) {
   const q = await client.query(

@@ -41,7 +41,7 @@ router.get('/', asyncHandler(async (req, res) => {
   const co = company.rows[0] || {};
   res.json({
     today,
-    hospital: { name: hospital.name, billingStartDate: hospital.billing_start_date, cycle: hospital.billing_cycle, doctors: hospital.doctors, gstApplicable: hospital.gst_applicable, gstRate: hospital.gst_rate, gstin: hospital.gstin },
+    hospital: { name: hospital.name, billingStartDate: hospital.billing_start_date, cycle: hospital.billing_cycle, doctors: hospital.doctors, freeDoctors: hospital.free_doctors, gstApplicable: hospital.gst_applicable, gstRate: hospital.gst_rate, gstin: hospital.gstin },
     plan,
     totals: {
       outstanding: round2(open.reduce((sum, r) => sum + r.total, 0)), outstandingCount: open.length,

@@ -5,7 +5,7 @@ import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { mobileSchema } from '../mobile.js';
-import { autoTopUp, deactivationImpact, doctorImpact, refreshOpenMonthlyInvoice } from '../billing/doctors.js';
+import { autoTopUp, deactivationImpact, doctorImpact, isFreeSpeciality, refreshOpenMonthlyInvoice } from '../billing/doctors.js';
 
 // Only these are offered for now (the others come back by adding them here and in frontend/src/speciality.js).
 export const SPECIALITIES = ['GENERAL_PHYSICIAN', 'PAEDIATRICIAN', 'DIETITIAN'];
@@ -48,13 +48,17 @@ const needsConfirm = (res, impact) => res.status(409).json({ code: 'BILLING_CONF
 router.get('/doctor-impact', asyncHandler(async (req, res) => {
   const candidateId = req.query.candidateId ? z.coerce.number().int().positive().parse(req.query.candidateId) : null;
   const removeId = req.query.removeId ? z.coerce.number().int().positive().parse(req.query.removeId) : null;
+  // a doctor of a free (Beta) speciality is not charged: nothing to confirm. `speciality` is the one being chosen; without it the doctor's own is used.
+  let speciality = req.query.speciality !== undefined ? String(req.query.speciality) : null;
+  if (req.query.speciality === undefined && (removeId || candidateId)) speciality = (await pool.query(`SELECT speciality FROM users WHERE id=$1 AND hospital_id=$2`, [removeId || candidateId, req.user.hospitalId])).rows[0]?.speciality ?? null;
+  if (isFreeSpeciality(speciality)) return res.json({ mode: 'NONE', requiresConfirm: false, free: true });
   res.json(removeId ? await deactivationImpact(pool, req.user.hospitalId, removeId) : await doctorImpact(pool, req.user.hospitalId, { candidateId }));
 }));
 
 router.post('/', asyncHandler(async (req, res) => {
   const data = userSchema.parse(req.body);
   await assertMobileNotReserved(data.mobile);
-  if (data.role === 'DOCTOR' && !data.acknowledgeBilling) {
+  if (data.role === 'DOCTOR' && !data.acknowledgeBilling && !isFreeSpeciality(data.speciality)) {
     const impact = await billingConfirmation(req.user.hospitalId);
     if (impact) return needsConfirm(res, impact);
   }
@@ -89,18 +93,19 @@ router.patch('/:id/status', asyncHandler(async (req, res) => {
   const { isActive: active, acknowledgeBilling } = z.object({ isActive: z.boolean(), acknowledgeBilling: z.boolean().optional().default(false) }).parse(req.body);
   const result = await withTransaction(async (client) => {
     const targetQ = await client.query(
-      `SELECT id,role,is_active FROM users
+      `SELECT id,role,is_active,speciality FROM users
        WHERE id=$1 AND hospital_id=$2 AND deleted_at IS NULL`,
       [req.params.id, req.user.hospitalId]
     );
     if (!targetQ.rowCount) throw notFound('User not found');
     const target = targetQ.rows[0];
     const reactivatingDoctor = active && target.role === 'DOCTOR' && !target.is_active;
-    if (!active && target.role === 'DOCTOR' && target.is_active && !acknowledgeBilling) {
+    const free = isFreeSpeciality(target.speciality); // a free (Beta) doctor changes nothing on the bill
+    if (!active && target.role === 'DOCTOR' && target.is_active && !acknowledgeBilling && !free) {
       const impact = await deactivationImpact(client, req.user.hospitalId, target.id);
       if (impact.requiresConfirm) return { confirm: impact };
     }
-    if (reactivatingDoctor && !acknowledgeBilling) {
+    if (reactivatingDoctor && !acknowledgeBilling && !free) {
       const impact = await billingConfirmation(req.user.hospitalId, target.id);
       if (impact) return { confirm: impact };
     }
@@ -139,14 +144,30 @@ router.patch('/:id/name', asyncHandler(async (req, res) => {
 }));
 
 router.patch('/:id/profile', asyncHandler(async (req, res) => {
-  const { qualification, registrationNo, speciality } = z.object({ qualification: z.string().trim().max(160), registrationNo: z.string().trim().max(40).optional().default(''), speciality: z.enum(SPECIALITIES).nullable().optional() }).parse(req.body);
-  // the speciality is changed only when it is sent; leaving it out keeps what is there
-  const q = await pool.query(
-    `UPDATE users SET qualification=$1,registration_no=$2,speciality=CASE WHEN $5::boolean THEN $6 ELSE speciality END,updated_at=NOW() WHERE id=$3 AND hospital_id=$4 AND role='DOCTOR' AND deleted_at IS NULL RETURNING id,name,qualification,registration_no,speciality`,
-    [qualification || null, registrationNo || null, req.params.id, req.user.hospitalId, speciality !== undefined, speciality ?? null]
-  );
-  if (!q.rowCount) throw notFound('Doctor not found');
-  res.json(q.rows[0]);
+  const { qualification, registrationNo, speciality, acknowledgeBilling } = z.object({ qualification: z.string().trim().max(160), registrationNo: z.string().trim().max(40).optional().default(''), speciality: z.enum(SPECIALITIES).nullable().optional(), acknowledgeBilling: z.boolean().optional().default(false) }).parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const cur = (await client.query(`SELECT speciality,is_active FROM users WHERE id=$1 AND hospital_id=$2 AND role='DOCTOR' AND deleted_at IS NULL FOR UPDATE`, [req.params.id, req.user.hospitalId])).rows[0];
+    if (!cur) throw notFound('Doctor not found');
+    // Moving an active doctor out of a free (Beta) speciality makes them charged like any doctor: the Admin confirms it first, as when adding a doctor.
+    // Moving one into it takes them off the bill.
+    const changes = speciality !== undefined && speciality !== cur.speciality;
+    const becomesCharged = changes && cur.is_active && isFreeSpeciality(cur.speciality) && !isFreeSpeciality(speciality);
+    const becomesFree = changes && cur.is_active && !isFreeSpeciality(cur.speciality) && isFreeSpeciality(speciality);
+    if (becomesCharged && !acknowledgeBilling) {
+      const impact = await billingConfirmation(req.user.hospitalId, Number(req.params.id));
+      if (impact) return { confirm: impact };
+    }
+    // speciality is changed only when it is sent; leaving it out keeps what is there
+    const q = await client.query(
+      `UPDATE users SET qualification=$1,registration_no=$2,speciality=CASE WHEN $5::boolean THEN $6 ELSE speciality END,updated_at=NOW() WHERE id=$3 AND hospital_id=$4 AND role='DOCTOR' AND deleted_at IS NULL RETURNING id,name,qualification,registration_no,speciality`,
+      [qualification || null, registrationNo || null, req.params.id, req.user.hospitalId, speciality !== undefined, speciality ?? null]
+    );
+    const topUp = becomesCharged ? await autoTopUp(client, req.user.hospitalId) : null;
+    const invoiceUpdated = becomesCharged || becomesFree ? await refreshOpenMonthlyInvoice(client, req.user.hospitalId) : null;
+    return { ...q.rows[0], topUp: topUp && { invoiceNo: topUp.invoiceNo, total: topUp.total, doctors: topUp.doctors }, invoiceUpdated };
+  });
+  if (result.confirm) return needsConfirm(res, result.confirm);
+  res.json(result);
 }));
 
 router.post('/:id/reset-password', asyncHandler(async (req, res) => {

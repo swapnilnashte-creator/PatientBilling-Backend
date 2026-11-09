@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool, withTransaction } from '../db.js';
 import { asyncHandler, badRequest, notFound } from '../utils.js';
-import { billableDoctors } from '../billing/doctors.js';
+import { billableDoctors, chargedSql } from '../billing/doctors.js';
 import {
   TIERS, RATE_FLOOR, addDays, addMonths, buildQuote, currentPeriodStart, cycleMonths, periodEndFor, pickPlan, rateFor, rateYearFor, round2, tierTable, todayString,
 } from '../billing/pricing.js';
@@ -170,7 +170,8 @@ export async function hospitalsWithDoctors(id = null) {
   const gstAvailable = await companyHasGstin();
   const q = await pool.query(
     `SELECT h.id,h.name,h.address,h.mobile,h.is_active,h.billing_start_date::text AS billing_start_date,h.billing_cycle,h.gst_applicable,h.gst_rate,h.gstin,
-            (SELECT COUNT(*)::int FROM users u WHERE u.hospital_id=h.id AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL) AS doctors,
+            (SELECT COUNT(*)::int FROM users u WHERE u.hospital_id=h.id AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL AND ${chargedSql('u')}) AS doctors,
+            (SELECT COUNT(*)::int FROM users u WHERE u.hospital_id=h.id AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL AND NOT ${chargedSql('u')}) AS free_doctors,
             adm.name AS admin_name,adm.mobile AS admin_mobile,adm.email AS admin_email
      FROM hospitals h
      LEFT JOIN LATERAL (SELECT u.name,u.mobile,u.email FROM users u WHERE u.hospital_id=h.id AND u.role='ADMIN' AND u.is_active=TRUE AND u.deleted_at IS NULL ORDER BY u.id LIMIT 1) adm ON TRUE
