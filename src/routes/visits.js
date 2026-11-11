@@ -412,14 +412,17 @@ router.get('/', asyncHandler(async (req, res) => {
   res.json(q.rows);
 }));
 
+// A doctor may open a visit that is with them, or one they have completed their consultation in (to review it or issue a certificate). Never another doctor's.
+async function assertDoctorMayOpen(client, hospitalId, visit, doctorId) {
+  if (Number(visit.doctor_id) === Number(doctorId)) return;
+  const took = (await client.query(`SELECT 1 FROM visit_doctors WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3 AND status='COMPLETED'`, [hospitalId, visit.id, doctorId])).rowCount;
+  if (!took) throw forbidden('This visit is assigned to another doctor');
+}
+
 router.get('/:id', asyncHandler(async (req, res) => {
   const client = pool;
   const visit = await getVisit(client, req.user.hospitalId, req.params.id);
-  if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) {
-    // a visit stays open to every doctor who has completed their consultation in it (to review details or issue a certificate)
-    const took = (await client.query(`SELECT 1 FROM visit_doctors WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3 AND status='COMPLETED'`, [req.user.hospitalId, req.params.id, req.user.id])).rowCount;
-    if (!took) throw forbidden('This visit is assigned to another doctor');
-  }
+  if (req.user.role === 'DOCTOR') await assertDoctorMayOpen(client, req.user.hospitalId, visit, req.user.id);
   const charges = await getCharges(client, req.user.hospitalId, req.params.id);
   const payment = await client.query(
     `SELECT p.id,p.amount,p.payment_mode,p.reference_no,p.accepted_by,p.paid_at,u.name AS accepted_by_name
@@ -506,7 +509,9 @@ async function getHandwriting(client, hospitalId, visitId) {
 }
 // The pad of an earlier visit, fetched when the doctor opens it from Previous visits (the visit list only says whether there is one).
 router.get('/:id/handwriting', allow('ADMIN','DOCTOR'), asyncHandler(async (req, res) => {
-  res.json({ handwriting: await getHandwriting(pool, req.user.hospitalId, z.coerce.number().int().positive().parse(req.params.id)) });
+  const id = z.coerce.number().int().positive().parse(req.params.id);
+  if (req.user.role === 'DOCTOR') await assertDoctorMayOpen(pool, req.user.hospitalId, await getVisit(pool, req.user.hospitalId, id), req.user.id); // another doctor's pad is theirs alone
+  res.json({ handwriting: await getHandwriting(pool, req.user.hospitalId, id) });
 }));
 const strokeSchema = z.object({ p: z.array(z.tuple([z.number().min(0).max(1000), z.number().min(0).max(4000), z.number().min(0).max(100)])).min(1).max(3000) });
 const MAX_POINTS = 60000;
@@ -532,6 +537,12 @@ router.put('/:id/handwriting', allow('DOCTOR'), asyncHandler(async (req, res) =>
 
 router.post('/:id/start', allow('ADMIN','DOCTOR','RECEPTIONIST'), asyncHandler(async (req, res) => {
   const result = await withTransaction(async (client) => {
+    // a doctor starts only a visit assigned to them. Checked first, so the answer is never about another doctor's patients.
+    if (req.user.role === 'DOCTOR') {
+      const own = await client.query(`SELECT doctor_id FROM visits WHERE id=$1 AND hospital_id=$2`, [req.params.id, req.user.hospitalId]);
+      if (!own.rowCount) throw notFound('Visit not found');
+      if (Number(own.rows[0].doctor_id) !== Number(req.user.id)) throw forbidden('This visit is assigned to another doctor');
+    }
     // one consultation at a time: the doctor must finish (or send on) the visit they have open before starting the next
     const target = await client.query(`SELECT doctor_id FROM visits WHERE id=$1 AND hospital_id=$2 AND status='WAITING_FOR_DOCTOR'`, [req.params.id, req.user.hospitalId]);
     if (target.rowCount) {
