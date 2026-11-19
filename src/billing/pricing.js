@@ -62,8 +62,8 @@ export function pickPlan(plans, startDate, asOf) {
 
 export const rateYearFor = (startDate, periodStart) => (periodStart < addMonths(startDate, 12) ? 1 : 2);
 
-/** Full quote for one invoice. */
-export function buildQuote({ plans, startDate, cycle, periodStart, doctors, adjustment = 0, gstApplicable = false, gstRate = 18 }) {
+/** Full quote for one invoice. messagesAmount = WhatsApp messages (Meta API) charged on this invoice, added to the subtotal. */
+export function buildQuote({ plans, startDate, cycle, periodStart, doctors, adjustment = 0, gstApplicable = false, gstRate = 18, messagesAmount = 0 }) {
   const n = Number(doctors);
   if (!Number.isInteger(n) || n < 1) throw Object.assign(new Error('At least one doctor is needed to raise an invoice'), { status: 400 });
   const months = cycleMonths(cycle);
@@ -72,14 +72,16 @@ export function buildQuote({ plans, startDate, cycle, periodStart, doctors, adju
   const baseRate = Number(rateYear === 1 ? plan.year1_base : plan.year2_base);
   const tier = tierFor(n);
   const rate = rateFor(baseRate, tier.pct);
-  const subtotal = round2(rate * n * months);
+  const subscription = round2(rate * n * months);
+  const messages = round2(Math.max(Number(messagesAmount) || 0, 0));
+  const subtotal = round2(subscription + messages);
   const credit = round2(Math.min(Math.max(Number(adjustment) || 0, 0), subtotal));
   const taxable = round2(subtotal - credit);
   const gstAmount = gstApplicable ? round2(taxable * Number(gstRate) / 100) : 0;
   return {
     cycle, periodStart, periodEnd: periodEndFor(periodStart, months), months, doctors: n,
     rateYear, planId: plan.id, baseRate, tierLabel: tier.label, discountPct: tier.pct, rate,
-    subtotal, adjustment: credit, taxable, gstApplicable: !!gstApplicable, gstRate: gstApplicable ? Number(gstRate) : 0,
+    subscription, messagesAmount: messages, subtotal, adjustment: credit, taxable, gstApplicable: !!gstApplicable, gstRate: gstApplicable ? Number(gstRate) : 0,
     gstAmount, total: round2(taxable + gstAmount),
     // what happens to this hospital's rate after the Year 1 lock ends
     lockEnds: rateYear === 1 ? addDays(addMonths(startDate, 12), -1) : null,

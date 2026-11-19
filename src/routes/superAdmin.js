@@ -23,7 +23,7 @@ router.get('/network-check', (req, res) => { res.json(networkReport(req, req.app
 
 router.get('/hospitals', asyncHandler(async (_req, res) => {
   const q = await pool.query(
-    `SELECT h.id,h.name,h.mobile,h.address,h.is_active,h.created_at,h.updated_at,h.deactivated_at,
+    `SELECT h.id,h.name,h.mobile,h.address,h.is_active,h.created_at,h.updated_at,h.deactivated_at,h.whatsapp_api_enabled,h.whatsapp_api_changed_at,h.whatsapp_api_hospital_on,h.whatsapp_api_hospital_changed_at,
             admin_user.id AS admin_id,admin_user.name AS admin_name,admin_user.mobile AS admin_mobile,admin_user.email AS admin_email,
             (SELECT COUNT(*)::int FROM users u WHERE u.hospital_id=h.id AND u.deleted_at IS NULL) AS users,
             (SELECT COUNT(*)::int FROM users u WHERE u.hospital_id=h.id AND u.role='DOCTOR' AND u.is_active=TRUE AND u.deleted_at IS NULL) AS doctors,
@@ -101,6 +101,24 @@ router.patch('/hospitals/:id/status', asyncHandler(async (req, res) => {
        VALUES($1,$2,$3,$4)`,
       [req.user.id, data.isActive ? 'ACTIVATE_HOSPITAL' : 'DEACTIVATE_HOSPITAL', req.params.id, JSON.stringify({ reason: data.reason })]
     );
+    return q.rows[0];
+  });
+  res.json(result);
+}));
+
+// WhatsApp messages through the paid Meta API: only the Super Admin switches them on or off for a hospital, with a reason for the audit.
+// Click-to-chat is free and stays available to every hospital either way.
+router.patch('/hospitals/:id/whatsapp-api', asyncHandler(async (req, res) => {
+  const data = z.object({ enabled: z.boolean(), reason: z.string().trim().min(5).max(500) }).parse(req.body);
+  const result = await withTransaction(async (client) => {
+    const q = await client.query(
+      `UPDATE hospitals SET whatsapp_api_enabled=$1,whatsapp_api_changed_at=NOW(),whatsapp_api_changed_by=$2,updated_at=NOW()
+       WHERE id=$3 RETURNING id,name,whatsapp_api_enabled,whatsapp_api_changed_at`,
+      [data.enabled, req.user.id, req.params.id]);
+    if (!q.rowCount) throw notFound('Hospital not found');
+    await client.query(
+      `INSERT INTO super_admin_audit_logs(superuser_id,action,hospital_id,metadata) VALUES($1,$2,$3,$4)`,
+      [req.user.id, data.enabled ? 'WHATSAPP_API_ENABLED' : 'WHATSAPP_API_DISABLED', req.params.id, JSON.stringify({ reason: data.reason })]);
     return q.rows[0];
   });
   res.json(result);

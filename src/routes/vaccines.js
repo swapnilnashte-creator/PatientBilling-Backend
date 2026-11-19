@@ -9,7 +9,7 @@ import { DEFAULT_REMINDER_MESSAGE, REMOVED_REMINDER_FIELDS, STARTER_VACCINES, ad
 const router = Router();
 const OPEN_FOR_STAFF = ['WAITING_FOR_DOCTOR', 'WITH_DOCTOR', 'PAYMENT_PENDING'];
 
-async function readSettings(db, hospitalId) {
+export async function readSettings(db, hospitalId) {
   const q = await db.query(
     `SELECT h.vaccination_enabled,h.vaccine_schedule_approved_at,h.vaccine_schedule_changed_at,h.vaccine_reminder_message,u.name AS approved_by_name
      FROM hospitals h LEFT JOIN users u ON u.id=h.vaccine_schedule_approved_by AND u.hospital_id=h.id WHERE h.id=$1`, [hospitalId]);
@@ -19,7 +19,7 @@ async function readSettings(db, hospitalId) {
 }
 const markChanged = (db, hospitalId) => db.query(`UPDATE hospitals SET vaccine_schedule_changed_at=NOW() WHERE id=$1`, [hospitalId]);
 
-async function loadCatalogue(db, hospitalId, { activeOnly = false } = {}) {
+export async function loadCatalogue(db, hospitalId, { activeOnly = false } = {}) {
   const v = await db.query(
     `SELECT id,name,protects_against,group_key,price,is_active,sort_order FROM vaccines WHERE hospital_id=$1 ${activeOnly ? 'AND is_active=TRUE' : ''} ORDER BY sort_order,lower(name)`, [hospitalId]);
   const s = await db.query(`SELECT vaccine_id,dose_no,label,due_age_days,min_age_days,min_gap_days FROM vaccine_schedule WHERE hospital_id=$1 ORDER BY vaccine_id,dose_no`, [hospitalId]);
@@ -30,7 +30,7 @@ async function loadCatalogue(db, hospitalId, { activeOnly = false } = {}) {
 const catalogueJson = (r) => ({ id: r.id, name: r.name, protectsAgainst: r.protects_against, group: r.group_key, price: r.price, isActive: r.is_active,
   doses: r.doses.map(d => ({ doseNo: d.dose_no, label: d.label, dueAgeDays: d.due_age_days, minAgeDays: d.min_age_days, minGapDays: d.min_gap_days })) });
 
-const recordsOf = async (db, hospitalId, patientIds) => {
+export const recordsOf = async (db, hospitalId, patientIds) => {
   if (!patientIds.length) return new Map();
   const q = await db.query(
     `SELECT pv.id,pv.patient_id,pv.vaccine_id,pv.dose_no,pv.status,to_char(pv.given_on,'YYYY-MM-DD') AS given_on,pv.batch_no,to_char(pv.expiry_on,'YYYY-MM') AS expiry_on,pv.site,pv.brand,pv.note,

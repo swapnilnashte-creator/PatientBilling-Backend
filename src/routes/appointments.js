@@ -131,7 +131,7 @@ router.delete('/days-off/:id', allow('ADMIN'), asyncHandler(async (req, res) => 
 }));
 
 // ---- the WhatsApp message for a booking ----
-export const DEFAULT_APPOINTMENT_MESSAGE = "Hello {patient},\n\nYour appointment at {hospital} with {doctor} is confirmed.\n\nDate: {date}\nTime: {time}\nBooking Reference: {reference}\n\nPlease show your booking reference at reception.\n\nFor changes or assistance, contact {hospitalPhone}.\n\nThank you,\n{hospital}";
+export const DEFAULT_APPOINTMENT_MESSAGE = "Hello {patient},\n\nYour appointment at {hospital} with {doctor} is confirmed.\n\nDate: {date}\nTime: {time}\nBooking Reference: {reference}\n\nPlease show your booking reference at reception.\n\nView your appointment: {link}\n\nFor changes or assistance, contact {hospitalPhone}.\n\nThank you,\n{hospital}";
 router.get('/message', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (req, res) => {
   const q = await pool.query('SELECT appointment_message FROM hospitals WHERE id=$1', [req.user.hospitalId]);
   res.json({ message: q.rows[0]?.appointment_message || null, defaultMessage: DEFAULT_APPOINTMENT_MESSAGE });
@@ -177,7 +177,7 @@ router.put('/reasons', allow('ADMIN'), asyncHandler(async (req, res) => {
 }));
 
 // ---- the bookings ----
-const COLUMNS = `a.id,a.reference,a.doctor_id,u.name AS doctor_name,a.slot_at,to_char(a.slot_day,'YYYY-MM-DD') AS day,
+const COLUMNS = `a.id,a.reference,a.view_code,a.doctor_id,u.name AS doctor_name,a.slot_at,to_char(a.slot_day,'YYYY-MM-DD') AS day,
   to_char(a.slot_at AT TIME ZONE 'Asia/Kolkata','HH24:MI') AS time,a.patient_id,a.full_name,a.mobile,a.gender,
   to_char(a.date_of_birth,'YYYY-MM-DD') AS date_of_birth,a.dob_estimated,a.reasons,a.reason_note,a.severity,a.status,a.source,a.visit_id,a.created_at,
   v.daily_number AS token,

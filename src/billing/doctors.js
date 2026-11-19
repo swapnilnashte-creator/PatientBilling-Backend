@@ -109,7 +109,7 @@ export async function doctorImpact(client, hospitalId, { candidateId = null, tod
 /** A monthly invoice that is issued but not yet paid, for the billing month that is running today. */
 async function openMonthlyInvoice(client, hospitalId, today, lock = false) {
   const q = await client.query(
-    `SELECT id,invoice_no,doctors,period_start::text AS period_start,period_end::text AS period_end,adjustment,gst_applicable,gst_rate,total,notes
+    `SELECT id,invoice_no,doctors,period_start::text AS period_start,period_end::text AS period_end,adjustment,gst_applicable,gst_rate,total,notes,messages_amount
      FROM platform_invoices
      WHERE hospital_id=$1 AND cycle='MONTHLY' AND kind='PERIOD' AND status='ISSUED' AND period_start<=$2::date AND period_end>=$2::date
      ORDER BY id DESC LIMIT 1 ${lock ? 'FOR UPDATE' : ''}`,
@@ -121,6 +121,7 @@ async function openMonthlyInvoice(client, hospitalId, today, lock = false) {
 const quoteForInvoice = (plans, startDate, inv, doctors) => buildQuote({
   plans, startDate, cycle: 'MONTHLY', periodStart: inv.period_start, doctors,
   adjustment: Number(inv.adjustment || 0), gstApplicable: Boolean(inv.gst_applicable), gstRate: num(inv.gst_rate) ?? 18,
+  messagesAmount: Number(inv.messages_amount || 0), // WhatsApp messages already on the invoice stay on it
 });
 
 /** A monthly invoice that is still unpaid follows the doctors of its month: when a doctor is added (or removed) during

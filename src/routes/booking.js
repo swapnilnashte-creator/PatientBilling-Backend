@@ -8,6 +8,8 @@ import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { mobileSchema } from '../mobile.js';
 import { bookableDays, hospitalHours, istDay, istTime, slotInstant, slotsOfDay } from '../bookingSlots.js';
 import { todayIst } from '../vaccination.js';
+import { sendAppointmentConfirmation } from '../whatsappApi.js';
+import { logError } from '../errorLog.js';
 
 const router = Router();
 const SECRET = () => String(process.env.JWT_SECRET || 'dev-secret');
@@ -189,6 +191,9 @@ const bookSchema = z.object({
 
 const REF_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const newReference = () => Array.from(crypto.randomBytes(8), b => REF_CHARS[b % REF_CHARS.length]).join('');
+// the private code in the patient's own link (dhacare.com/booking/<code>): 12 lowercase letters and digits, never the booking number
+const VIEW_CHARS = 'abcdefghjkmnpqrstuvwxyz23456789';
+const newViewCode = () => Array.from(crypto.randomBytes(12), b => VIEW_CHARS[b % VIEW_CHARS.length]).join('');
 
 // counts attempts from one device and one mobile; older entries are removed as we go
 async function tooMany(hospitalId, kind, key, limit, windowSql) {
@@ -274,11 +279,11 @@ router.post('/h/:slug/book', asyncHandler(async (req, res) => {
     if (!slot || off.rowCount) throw badRequest('That time is not open for booking. Please choose another.');
     // the same person, doctor and day: the same request sent twice (a double tap) gets the booking already made; a different time is refused
     const dupe = await client.query(
-      `SELECT reference,slot_at,ip_hash FROM appointments WHERE hospital_id=$1 AND doctor_id=$2 AND slot_day=$3 AND mobile=$4 AND lower(full_name)=lower($5) AND status='BOOKED' LIMIT 1`,
+      `SELECT reference,view_code,slot_at,ip_hash FROM appointments WHERE hospital_id=$1 AND doctor_id=$2 AND slot_day=$3 AND mobile=$4 AND lower(full_name)=lower($5) AND status='BOOKED' LIMIT 1`,
       [hospital.id, d.doctorId, day, who.mobile, who.fullName]);
     if (dupe.rowCount) {
       const old = dupe.rows[0];
-      if (new Date(old.slot_at).getTime() === slotAt.getTime() && old.ip_hash === ipKey) return { reference: old.reference, doctorName: doc.rows[0].name };
+      if (new Date(old.slot_at).getTime() === slotAt.getTime() && old.ip_hash === ipKey) return { reference: old.reference, viewCode: old.view_code, doctorName: doc.rows[0].name };
       throw Object.assign(new Error(`You already have an appointment with this doctor on that day, at ${istTime(old.slot_at)}. To change it, please call the hospital${hospital.mobile ? ` on ${hospital.mobile}` : ''}.`), { status: 409, duplicate: true });
     }
     const used = await client.query(`SELECT COUNT(*)::int AS n FROM appointments WHERE hospital_id=$1 AND doctor_id=$2 AND slot_at=$3 AND status IN ('BOOKED','ARRIVED')`, [hospital.id, d.doctorId, slotAt]);
@@ -288,16 +293,21 @@ router.post('/h/:slug/book', asyncHandler(async (req, res) => {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const reference = newReference();
       const ins = await client.query(
-        `INSERT INTO appointments(hospital_id,reference,doctor_id,slot_at,slot_day,patient_id,full_name,mobile,gender,date_of_birth,dob_estimated,reasons,reason_note,source,ip_hash,severity)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-         ON CONFLICT (hospital_id, reference) DO NOTHING RETURNING reference`,
-        [hospital.id, reference, d.doctorId, slotAt, day, who.patientId, who.fullName, who.mobile, who.gender, who.dob, who.dobEstimated, who.reasons, who.reasonNote || null, who.source, ipKey, who.severity]);
-      if (ins.rowCount) return { reference, doctorName: doc.rows[0].name };
+        `INSERT INTO appointments(hospital_id,reference,doctor_id,slot_at,slot_day,patient_id,full_name,mobile,gender,date_of_birth,dob_estimated,reasons,reason_note,source,ip_hash,severity,view_code)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+         ON CONFLICT (hospital_id, reference) DO NOTHING RETURNING id,reference,view_code`,
+        [hospital.id, reference, d.doctorId, slotAt, day, who.patientId, who.fullName, who.mobile, who.gender, who.dob, who.dobEstimated, who.reasons, who.reasonNote || null, who.source, ipKey, who.severity, newViewCode()]);
+      if (ins.rowCount) return { id: Number(ins.rows[0].id), reference, viewCode: ins.rows[0].view_code, doctorName: doc.rows[0].name };
     }
     throw new Error('Could not create a booking reference');
   });
-  res.status(201).json({ reference: row.reference, doctorName: row.doctorName, hospitalName: hospital.name, slotAt: slotAt.toISOString(), day, time });
+  res.status(201).json({ reference: row.reference, viewCode: row.viewCode, doctorName: row.doctorName, hospitalName: hospital.name, slotAt: slotAt.toISOString(), day, time });
+  // a new booking (not the same request sent twice): the WhatsApp confirmation, when the hospital has automatic messages on
+  if (row.id) confirmOnWhatsApp(row.id);
 }));
+
+// After the answer has gone to the patient: never makes the booking wait or fail.
+const confirmOnWhatsApp = (appointmentId) => { sendAppointmentConfirmation(appointmentId).catch(err => logError(err, { source: `whatsapp confirmation appointment ${appointmentId}` })); };
 
 // ---- the patient moves their own booking to another time ----
 // Who may: whoever knows the booking number AND the mobile number it was made with. Only a booking that is still waiting, up to an hour
@@ -377,9 +387,55 @@ router.post('/h/:slug/manage/reschedule', asyncHandler(async (req, res) => {
       if (err.code === '23505') throw Object.assign(new Error('You already have another appointment with this doctor on that day. Please choose another day.'), { status: 409 });
       throw err;
     }
-    return { doctorName: own.doctor_name, left: Math.max(0, RESCHEDULE.max - own.reschedule_count - 1) };
+    return { id: Number(own.id), doctorName: own.doctor_name, left: Math.max(0, RESCHEDULE.max - own.reschedule_count - 1) };
   });
+  confirmOnWhatsApp(out.id); // the new time, confirmed on WhatsApp like a new booking
   res.json({ reference: d.reference, doctorName: out.doctorName, hospitalName: hospital.name, slotAt: slotAt.toISOString(), day, time, changesLeft: out.left });
+}));
+
+// ---- the patient's own appointment page: dhacare.com/booking/<code> ----
+// The link is sent to the patient on WhatsApp. It shows the appointment only: no reason for the visit, no full name or mobile number,
+// nothing from the hospital's patient records. It stops working a week after the appointment day.
+export const VIEW_DAYS_AFTER = 7;
+const VIEW_GONE = 'This appointment link is not valid or has expired. Please call the clinic.';
+const viewMisses = new Map(); // wrong codes per device, so codes cannot be tried one after another
+router.get('/booking/:code', asyncHandler(async (req, res) => {
+  const now = Date.now();
+  const key = req.ip || 'x';
+  const misses = (viewMisses.get(key) || []).filter(t => now - t < 3600e3);
+  if (misses.length >= 20) return res.status(429).json({ message: 'Too many tries. Please wait a while, or call the clinic.' });
+  const miss = () => {
+    misses.push(now); viewMisses.set(key, misses);
+    if (viewMisses.size > 5000) for (const [k, v] of viewMisses) if (!v.some(t => now - t < 3600e3)) viewMisses.delete(k);
+    return notFound(VIEW_GONE);
+  };
+  const code = String(req.params.code || '').trim();
+  if (!/^[a-z0-9]{12}$/.test(code)) throw miss();
+  const q = await pool.query(
+    `SELECT a.reference,a.slot_at,a.status,a.reschedule_count,a.full_name,a.mobile,
+            u.name AS doctor_name,u.qualification,(u.online_booking AND u.is_active AND u.deleted_at IS NULL) AS doctor_books,
+            h.id AS hospital_id,h.name AS hospital_name,h.mobile AS hospital_mobile,h.address,h.booking_slug,h.booking_enabled
+     FROM appointments a
+     JOIN users u ON u.hospital_id=a.hospital_id AND u.id=a.doctor_id
+     JOIN hospitals h ON h.id=a.hospital_id
+     WHERE a.view_code=$1 AND h.is_active=TRUE AND h.deactivated_at IS NULL
+       AND a.slot_day >= (NOW() AT TIME ZONE 'Asia/Kolkata')::date - $2::int`, [code, VIEW_DAYS_AFTER]);
+  if (!q.rowCount) throw miss();
+  const r = q.rows[0];
+  // changing the time goes through the hospital's booking page, so it needs online booking to be on
+  const bookable = Boolean(r.booking_enabled && r.booking_slug && captchaReady());
+  const can = r.status === 'BOOKED' && bookable && r.doctor_books ? canMove(r) : { ok: false, reason: '' };
+  res.json({
+    hospital: { name: r.hospital_name, mobile: r.hospital_mobile || '', address: r.address || '', hours: await hospitalHours(r.hospital_id), slug: bookable ? r.booking_slug : '' },
+    doctor: { name: r.doctor_name, qualification: r.qualification || '' },
+    reference: r.reference,
+    patient: String(r.full_name || '').trim().split(' ')[0],
+    mobileEnd: String(r.mobile || '').slice(-4),
+    day: istDay(r.slot_at), time: istTime(r.slot_at), slotAt: new Date(r.slot_at).toISOString(),
+    past: new Date(r.slot_at).getTime() < now,
+    status: r.status, moved: r.reschedule_count > 0,
+    canChange: can.ok, changeNote: r.status === 'BOOKED' && !can.ok ? can.reason : '',
+  });
 }));
 
 export default router;

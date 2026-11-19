@@ -6,6 +6,9 @@ import { billableDoctors, chargedSql } from '../billing/doctors.js';
 import {
   TIERS, RATE_FLOOR, addDays, addMonths, buildQuote, currentPeriodStart, cycleMonths, periodEndFor, pickPlan, rateFor, rateYearFor, round2, tierTable, todayString,
 } from '../billing/pricing.js';
+import { attachMessages, currentMessageRate, messagesCutoff, messagesToBill, releaseMessages } from '../billing/messages.js';
+import { whatsappConfigured, whatsappPlatformOn } from '../whatsappApi.js';
+import { forgetReminderDays, reminderDefaults, timesSchema } from '../whatsappReminders.js';
 
 // Super Admin → platform billing: rates, hospital billing settings, invoices. Mounted at /api/super-admin/billing.
 const router = Router();
@@ -188,7 +191,8 @@ const invoiceStatus = (row, today) => {
 };
 export const invoiceSelect = `SELECT i.id,i.invoice_no,i.hospital_id,h.name AS hospital_name,i.cycle,i.period_start::text AS period_start,i.period_end::text AS period_end,
          i.doctors,i.rate_year,i.base_rate,i.tier_label,i.discount_pct,i.rate,i.months,i.subtotal,i.adjustment,i.adjustment_reason,i.gst_applicable,i.gst_rate,i.gst_amount,i.gstin,i.total,
-         i.kind,i.parent_id,i.prev_doctors,i.prev_rate,i.prorate_days,i.period_days,i.status,i.issue_date::text AS issue_date,i.due_date::text AS due_date,i.paid_on::text AS paid_on,i.paid_amount,i.payment_mode,i.payment_reference,i.payment_note,i.notes,i.cancel_reason,i.created_at
+         i.kind,i.parent_id,i.prev_doctors,i.prev_rate,i.prorate_days,i.period_days,i.status,i.issue_date::text AS issue_date,i.due_date::text AS due_date,i.paid_on::text AS paid_on,i.paid_amount,i.payment_mode,i.payment_reference,i.payment_note,i.notes,i.cancel_reason,i.created_at,
+         i.messages_count,i.messages_amount,i.messages_upto::text AS messages_upto,i.messages_detail
   FROM platform_invoices i JOIN hospitals h ON h.id=i.hospital_id`;
 export function invoiceJson(row, today) {
   return {
@@ -199,6 +203,9 @@ export function invoiceJson(row, today) {
     gstAmount: num(row.gst_amount), gstin: row.gstin, total: num(row.total), status: row.status, displayStatus: invoiceStatus(row, today),
     issueDate: row.issue_date, dueDate: row.due_date, paidOn: row.paid_on, paidAmount: num(row.paid_amount), paymentMode: row.payment_mode,
     paymentReference: row.payment_reference, paymentNote: row.payment_note, notes: row.notes, cancelReason: row.cancel_reason, createdAt: row.created_at,
+    // WhatsApp messages (Meta API) charged on this invoice: already inside subtotal and total; the subscription line is the rest
+    messagesCount: Number(row.messages_count || 0), messagesAmount: num(row.messages_amount) || 0, messagesUpto: row.messages_upto || null, messagesDetail: row.messages_detail || [],
+    subscriptionAmount: round2(Number(row.subtotal) - Number(row.messages_amount || 0)),
   };
 }
 
@@ -313,7 +320,7 @@ const invoiceInput = z.object({
   notes: z.string().trim().max(500).optional().default(''),
 });
 
-async function quoteFor(client, input) {
+async function quoteFor(client, input, invoiceId = null) {
   const [hospital] = await hospitalsWithDoctors(input.hospitalId);
   if (!hospital) throw notFound('Hospital not found');
   if (input.periodStart < hospital.billing_start_date) throw badRequest(`The period cannot start before the hospital's billing start date (${hospital.billing_start_date})`);
@@ -321,9 +328,11 @@ async function quoteFor(client, input) {
   // Monthly clinics are billed for the doctors of that month; annual ones for the doctors active now.
   const billable = input.cycle === 'MONTHLY' ? await billableDoctors(client, hospital.id, input.periodStart, periodEndFor(input.periodStart, 1)) : null;
   const doctors = input.doctors ?? (billable ? billable.count : hospital.doctors);
+  // WhatsApp messages not billed yet, up to the end of the period (or yesterday, if the period has not ended)
+  const messages = await messagesToBill(client, hospital.id, messagesCutoff(periodEndFor(input.periodStart, cycleMonths(input.cycle))), invoiceId);
   const quote = buildQuote({
     plans, startDate: hospital.billing_start_date, cycle: input.cycle, periodStart: input.periodStart, doctors,
-    adjustment: input.adjustment, gstApplicable: hospital.gst_applicable, gstRate: hospital.gst_rate ?? 18,
+    adjustment: input.adjustment, gstApplicable: hospital.gst_applicable, gstRate: hospital.gst_rate ?? 18, messagesAmount: messages.amount,
   });
   let nextRate = null;
   if (quote.rateYear === 1) {
@@ -332,12 +341,12 @@ async function quoteFor(client, input) {
     const from = addMonths(quote.periodStart, quote.months);
     nextRate = { from, rate: buildQuote({ plans, startDate: hospital.billing_start_date, cycle: input.cycle, periodStart: from, doctors }).rate };
   }
-  return { hospital, quote, nextRate, billable };
+  return { hospital, quote, nextRate, billable, messages };
 }
 
 router.get('/quote', asyncHandler(async (req, res) => {
   const input = invoiceInput.parse({ ...req.query, doctors: req.query.doctors || undefined, adjustment: req.query.adjustment || 0 });
-  const { hospital, quote, nextRate, billable } = await quoteFor(pool, input);
+  const { hospital, quote, nextRate, billable, messages } = await quoteFor(pool, input);
   const overlap = await pool.query(
     `SELECT invoice_no FROM platform_invoices WHERE hospital_id=$1 AND status<>'CANCELLED' AND kind='PERIOD' AND period_start<=$3::date AND period_end>=$2::date LIMIT 1`,
     [input.hospitalId, quote.periodStart, quote.periodEnd]
@@ -345,6 +354,7 @@ router.get('/quote', asyncHandler(async (req, res) => {
   res.json({
     quote, nextRate, activeDoctors: hospital.doctors, billable: billable && { count: billable.count, active: billable.active, removedButConsulted: billable.removedButConsulted }, hospital: { id: hospital.id, name: hospital.name, startDate: hospital.billing_start_date, gstApplicable: hospital.gst_applicable, gstRequested: hospital.gst_requested, gstAvailable: await companyHasGstin(), gstRate: hospital.gst_rate, gstin: hospital.gstin, cycle: hospital.billing_cycle },
     overlapsInvoice: overlap.rows[0]?.invoice_no || null,
+    messages,
   });
 }));
 
@@ -383,7 +393,7 @@ router.get('/invoices/:id', asyncHandler(async (req, res) => {
 }));
 
 async function createInvoice(client, req, input, status) {
-  const { hospital, quote } = await quoteFor(client, input);
+  const { hospital, quote, messages } = await quoteFor(client, input);
   if (!hospital.is_active) throw badRequest('This company is inactive. Activate it before raising an invoice.');
   if (quote.adjustment > 0 && input.adjustmentReason.length < 3) throw badRequest('Give a reason for the discount or credit');
   const overlap = await client.query(
@@ -404,8 +414,25 @@ async function createInvoice(client, req, input, status) {
       quote.adjustment, quote.adjustment > 0 ? input.adjustmentReason : null, quote.gstApplicable, quote.gstRate, quote.gstAmount, quote.gstApplicable ? hospital.gstin : null, quote.total, status,
       issued ? today : null, due, input.notes || null, req.user.id]
   );
-  await audit(client, req, issued ? 'INVOICE_ISSUED' : 'INVOICE_CREATED', hospital.id, { invoiceNo, total: quote.total, cycle: input.cycle, period: `${quote.periodStart} to ${quote.periodEnd}` });
+  const final = await chargeMessages(client, ins.rows[0].id, hospital, input, quote, messages.upto);
+  await audit(client, req, issued ? 'INVOICE_ISSUED' : 'INVOICE_CREATED', hospital.id, { invoiceNo, total: final.total, cycle: input.cycle, period: `${quote.periodStart} to ${quote.periodEnd}`, messages: final.messagesCount || undefined });
   return { id: ins.rows[0].id, invoiceNo };
+}
+
+// Puts the hospital's unbilled WhatsApp messages on the invoice. If messages changed since the quote, the amounts are worked out again.
+async function chargeMessages(client, invoiceId, hospital, input, quote, upto) {
+  const got = await attachMessages(client, invoiceId, hospital.id, upto);
+  let q = quote;
+  if (got.amount !== quote.messagesAmount) {
+    q = buildQuote({
+      plans: await loadPlans(client), startDate: hospital.billing_start_date, cycle: input.cycle, periodStart: input.periodStart, doctors: quote.doctors,
+      adjustment: input.adjustment, gstApplicable: hospital.gst_applicable, gstRate: hospital.gst_rate ?? 18, messagesAmount: got.amount,
+    });
+  }
+  await client.query(
+    `UPDATE platform_invoices SET subtotal=$2,adjustment=$3,gst_amount=$4,total=$5,messages_count=$6,messages_amount=$7,messages_upto=$8,messages_detail=$9 WHERE id=$1`,
+    [invoiceId, q.subtotal, q.adjustment, q.gstAmount, q.total, got.count, got.amount, got.count ? upto : null, JSON.stringify(got.detail)]);
+  return { total: q.total, messagesCount: got.count };
 }
 
 function translateDuplicate(error) {
@@ -429,7 +456,7 @@ router.put('/invoices/:id', asyncHandler(async (req, res) => {
     if (!cur.rowCount) throw notFound('Invoice not found');
     if (cur.rows[0].status !== 'DRAFT') throw badRequest('Only a draft can be edited. Cancel the invoice and raise a new one instead.');
     if (Number(cur.rows[0].hospital_id) !== input.hospitalId) throw badRequest('The hospital of an invoice cannot be changed');
-    const { hospital, quote } = await quoteFor(client, input);
+    const { hospital, quote, messages } = await quoteFor(client, input, id);
     if (quote.adjustment > 0 && input.adjustmentReason.length < 3) throw badRequest('Give a reason for the discount or credit');
     const overlap = await client.query(
       `SELECT invoice_no FROM platform_invoices WHERE hospital_id=$1 AND id<>$4 AND status<>'CANCELLED' AND kind='PERIOD' AND period_start<=$3::date AND period_end>=$2::date LIMIT 1`,
@@ -442,6 +469,7 @@ router.put('/invoices/:id', asyncHandler(async (req, res) => {
       [input.cycle, quote.periodStart, quote.periodEnd, quote.doctors, quote.rateYear, quote.baseRate, quote.tierLabel, quote.discountPct, quote.rate, quote.months, quote.subtotal, quote.adjustment,
         quote.adjustment > 0 ? input.adjustmentReason : null, quote.gstApplicable, quote.gstRate, quote.gstAmount, quote.gstApplicable ? hospital.gstin : null, quote.total, input.dueDate || addDays(todayString(), 14), input.notes || null, id]
     );
+    await chargeMessages(client, id, hospital, input, quote, messages.upto);
   }).catch(translateDuplicate);
   res.json(await invoiceDetail(id));
 }));
@@ -492,6 +520,7 @@ router.post('/invoices/:id/cancel', asyncHandler(async (req, res) => {
       [id, reason]
     );
     if (!q.rowCount) throw badRequest('A paid invoice cannot be cancelled');
+    await releaseMessages(client, id); // its WhatsApp messages go on the next invoice
     await audit(client, req, 'INVOICE_CANCELLED', q.rows[0].hospital_id, { invoiceNo: q.rows[0].invoice_no, reason });
   });
   res.json(await invoiceDetail(id));
@@ -520,8 +549,9 @@ async function monthlyRows(month) {
     const bill = await billableDoctors(pool, h.id, periodStart, periodEnd, today);
     base.doctors = bill.count; base.activeDoctors = bill.active; base.removedButConsulted = bill.removedButConsulted.map(d => d.name);
     if (bill.count < 1) { rows.push({ ...base, state: 'NO_DOCTORS' }); continue; }
-    const q = buildQuote({ plans, startDate: h.billing_start_date, cycle: 'MONTHLY', periodStart, doctors: bill.count, gstApplicable: h.gst_applicable, gstRate: h.gst_rate ?? 18 });
-    rows.push({ ...base, periodEnd: q.periodEnd, rate: q.rate, rateYear: q.rateYear, tierLabel: q.tierLabel, subtotal: q.subtotal, gstAmount: q.gstAmount, total: q.total, state: periodEnd < today ? 'READY' : 'UPCOMING', readyOn: addDays(periodEnd, 1) });
+    const msgs = await messagesToBill(pool, h.id, messagesCutoff(periodEnd, today));
+    const q = buildQuote({ plans, startDate: h.billing_start_date, cycle: 'MONTHLY', periodStart, doctors: bill.count, gstApplicable: h.gst_applicable, gstRate: h.gst_rate ?? 18, messagesAmount: msgs.amount });
+    rows.push({ ...base, messagesCount: msgs.count, messagesAmount: msgs.amount, periodEnd: q.periodEnd, rate: q.rate, rateYear: q.rateYear, tierLabel: q.tierLabel, subtotal: q.subtotal, gstAmount: q.gstAmount, total: q.total, state: periodEnd < today ? 'READY' : 'UPCOMING', readyOn: addDays(periodEnd, 1) });
   }
   return rows;
 }
@@ -541,6 +571,55 @@ router.post('/invoices/generate-monthly', asyncHandler(async (req, res) => {
     } catch (e) { skipped.push({ hospital: row.hospital, reason: e.message }); }
   }
   res.status(201).json({ created, skipped });
+}));
+
+// ---------- WhatsApp messages (Meta API): price per message ----------
+// A new rate applies to messages sent from now on; messages already sent keep the rate they were sent at.
+router.get('/message-rate', asyncHandler(async (_req, res) => {
+  const q = await pool.query(
+    `SELECT r.id,r.rate::float8 AS rate,r.reason,r.created_at,s.name AS by_name FROM platform_message_rates r
+     LEFT JOIN platform_superusers s ON s.id=r.created_by ORDER BY r.created_at DESC,r.id DESC LIMIT 50`);
+  const on = await pool.query(`SELECT COUNT(*)::int AS n FROM hospitals WHERE whatsapp_api_enabled=TRUE AND is_active=TRUE`);
+  const sw = (await pool.query(`SELECT w.sending_on,w.reason,w.changed_at,s.name AS by_name FROM platform_whatsapp w LEFT JOIN platform_superusers s ON s.id=w.changed_by WHERE w.id=1`)).rows[0] || {};
+  res.json({ rate: await currentMessageRate(), hospitalsOn: on.rows[0].n, platformOn: Boolean(sw.sending_on), configured: whatsappConfigured(),
+    sending: { on: Boolean(sw.sending_on), reason: sw.reason || null, at: sw.changed_at || null, by: sw.by_name || null }, reminders: await reminderDefaults(), history: q.rows.map(r => ({ id: r.id, rate: Number(r.rate), reason: r.reason, at: r.created_at, by: r.by_name })) });
+}));
+router.post('/message-rate', asyncHandler(async (req, res) => {
+  const body = z.object({ rate: z.coerce.number().positive().max(100), reason: z.string().trim().min(5).max(500) }).parse(req.body);
+  if (Math.round(body.rate * 10000) / 10000 !== body.rate) throw badRequest('Use at most 4 digits after the decimal point, for example 0.125');
+  const before = await currentMessageRate();
+  if (body.rate === before) throw badRequest('This is already the rate per message');
+  await withTransaction(async (client) => {
+    await client.query(`INSERT INTO platform_message_rates(rate,reason,created_by) VALUES($1,$2,$3)`, [body.rate, body.reason, req.user.id]);
+    await audit(client, req, 'MESSAGE_RATE_UPDATED', null, { reason: body.reason, from: before, to: body.rate });
+  });
+  res.status(201).json({ rate: body.rate });
+}));
+
+// The platform switch for all WhatsApp messages through Meta: off = nothing is sent for any hospital. Reason required, audited.
+router.post('/whatsapp-sending', asyncHandler(async (req, res) => {
+  const body = z.object({ on: z.boolean(), reason: z.string().trim().min(5).max(500) }).parse(req.body);
+  if (body.on === await whatsappPlatformOn()) throw badRequest(body.on ? 'WhatsApp sending is already on' : 'WhatsApp sending is already paused');
+  if (body.on && !whatsappConfigured()) throw badRequest('The Meta details are missing on the server (WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID in .env). Add them and restart the backend first.');
+  await withTransaction(async (client) => {
+    await client.query(`UPDATE platform_whatsapp SET sending_on=$1,reason=$2,changed_by=$3,changed_at=NOW() WHERE id=1`, [body.on, body.reason, req.user.id]);
+    await audit(client, req, body.on ? 'WHATSAPP_SENDING_ON' : 'WHATSAPP_SENDING_OFF', null, { reason: body.reason });
+  });
+  res.json({ on: body.on });
+}));
+
+// DhaCare's default reminder times, for every hospital that has not chosen its own. Reason required, audited.
+router.put('/reminder-defaults', asyncHandler(async (req, res) => {
+  const body = timesSchema.extend({ reason: z.string().trim().min(5).max(500) }).parse(req.body);
+  const { reason, ...times } = body;
+  const before = await reminderDefaults();
+  if (JSON.stringify(before) === JSON.stringify(times)) throw badRequest('These are already the default reminder times');
+  await withTransaction(async (client) => {
+    await client.query(`UPDATE platform_whatsapp SET reminder_defaults=$1 WHERE id=1`, [JSON.stringify(times)]);
+    await audit(client, req, 'REMINDER_DEFAULTS_UPDATED', null, { reason, from: before, to: times });
+  });
+  forgetReminderDays(); // every hospital's lists are looked at again with the new times
+  res.json({ reminders: times });
 }));
 
 // ---------- company details printed on invoices ----------
