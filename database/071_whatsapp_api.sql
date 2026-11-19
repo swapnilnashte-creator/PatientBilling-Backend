@@ -74,8 +74,8 @@ INSERT INTO platform_whatsapp(id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 -- appointment: hours before the appointment. followUp / vaccination: days before the date, at this hour (India time).
 ALTER TABLE platform_whatsapp ADD COLUMN IF NOT EXISTS reminder_defaults JSONB NOT NULL
   DEFAULT '{"appointment":{"hours":24},"followUp":{"days":1,"hour":10},"vaccination":{"days":2,"hour":10}}';
--- The hospital's own choices (Hospital Settings > Subscription > WhatsApp): each reminder on or off, and only the times that differ from
--- DhaCare's defaults are kept, so a later change of a default still reaches the hospital. NULL = all defaults, all on.
+-- The hospital's own choices (Hospital Settings > Subscription > WhatsApp): the reminders it turned on, and only the times that differ from
+-- DhaCare's defaults are kept, so a later change of a default still reaches the hospital. NULL = default times, every reminder off.
 ALTER TABLE hospitals ADD COLUMN IF NOT EXISTS whatsapp_reminders JSONB;
 
 -- which patient a reminder was for, and what it was about (the follow-up visit or the vaccine due date), so it is sent only once
