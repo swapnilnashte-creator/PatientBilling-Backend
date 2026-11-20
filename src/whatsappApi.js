@@ -98,11 +98,24 @@ export async function sendTemplate({ to, template, body = [], button = null }) {
   }
 }
 
+// A number the hospital blocked (Hospital Settings > WhatsApp > Blocked numbers, or Cancel and block on Appointments) gets no
+// automatic message either. For a patient, their mobile and their WhatsApp number are both checked, so a blocked person is not
+// reached on their other number.
+export async function isBlockedNumber(hospitalId, toMobile, patientId = null, db = pool) {
+  const q = await db.query(
+    `SELECT EXISTS (SELECT 1 FROM blocked_mobiles b WHERE b.hospital_id=$1 AND (b.mobile=$2
+       OR ($3::bigint IS NOT NULL AND b.mobile IN (SELECT right(regexp_replace(x,'\\D','','g'),10) FROM patients p, unnest(ARRAY[p.mobile,p.whatsapp_mobile]) AS x
+                                                   WHERE p.hospital_id=$1 AND p.id=$3 AND x IS NOT NULL)))) AS blocked`,
+    [hospitalId, last10(toMobile), patientId]);
+  return q.rows[0].blocked;
+}
+
 // Checks the switches, sends, and records the message (charged if sent, not charged if failed).
-// Answers 'SENT', 'FAILED' or 'SKIPPED' (switched off, or the Meta details are missing). Never throws.
+// Answers 'SENT', 'FAILED' or 'SKIPPED' (switched off, the Meta details are missing, or the number is blocked). Never throws.
 export async function sendWhatsApp({ hospitalId, appointmentId = null, patientId = null, ref = null, kind, toMobile, body, button }) {
   try {
     if (!whatsappConfigured() || !mayMessage(toMobile) || !(await whatsappApiAllowed(hospitalId))) return 'SKIPPED';
+    if (await isBlockedNumber(hospitalId, toMobile, patientId)) return 'SKIPPED'; // blocked: nothing sent, nothing charged
     const template = TEMPLATES[kind];
     const r = await sendTemplate({ to: toMobile, template, body, button });
     await recordWhatsAppMessage({ hospitalId, appointmentId, patientId, ref, kind, template, toMobile, status: r.ok ? 'SENT' : 'FAILED', metaMessageId: r.id, error: r.error });

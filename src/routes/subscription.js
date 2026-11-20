@@ -92,6 +92,12 @@ router.get('/', asyncHandler(async (req, res) => {
   });
 }));
 
+// Hospital Settings > WhatsApp > Automatic messages: the switch, the price and the reminder times (null = DhaCare never switched them on).
+router.get('/whatsapp', asyncHandler(async (req, res) => {
+  const invoices = (await pool.query(`${invoiceSelect} WHERE i.hospital_id=$1 AND i.status<>'DRAFT'`, [req.user.hospitalId])).rows.map(r => invoiceJson(r, todayString()));
+  res.json({ whatsapp: await whatsappBilling(req.user.hospitalId, invoices) });
+}));
+
 // The hospital's own switch for WhatsApp messages through Meta. Works only while DhaCare allows them for the hospital:
 // when DhaCare has switched them off, nothing is sent and this switch cannot turn them on.
 router.put('/whatsapp', asyncHandler(async (req, res) => {

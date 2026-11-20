@@ -1,6 +1,6 @@
 // Automatic WhatsApp reminders through Meta: appointment, follow-up and vaccination.
-// When: DhaCare's default times (Super Admin, Pricing > WhatsApp messages), or the hospital's own (Hospital Settings > Subscription >
-// WhatsApp), where each reminder is off until the hospital turns it on. Who: only hospitals with WhatsApp messages on (all switches, see whatsappApi.js).
+// When: DhaCare's default times (Super Admin, Pricing > WhatsApp messages), or the hospital's own (Hospital Settings > WhatsApp >
+// Automatic messages), where each reminder is off until the hospital turns it on. Who: only hospitals with WhatsApp messages on (all switches, see whatsappApi.js).
 // A timer checks every 10 minutes, between 7 AM and 9 PM India time only. Each reminder is sent once (whatsapp_messages.ref).
 import { z } from 'zod';
 import { pool } from './db.js';
