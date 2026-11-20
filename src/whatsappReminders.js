@@ -7,7 +7,7 @@ import { pool } from './db.js';
 import { logError } from './errorLog.js';
 import { sendWhatsApp, waClock, waDay, whatsappConfigured, whatsappPlatformOn } from './whatsappApi.js';
 import { addDays, workOutSchedule } from './vaccination.js';
-import { loadCatalogue, readSettings as vaccinationSettings, recordsOf } from './routes/vaccines.js';
+import { cancelledDoses, loadCatalogue, readSettings as vaccinationSettings, recordsOf } from './routes/vaccines.js';
 
 export const KINDS = ['appointment', 'followUp', 'vaccination'];
 export const QUIET = { from: 21, to: 7 }; // nothing is sent from 9 PM to 7 AM
@@ -86,7 +86,7 @@ async function appointmentReminders(h, hours, now) {
   return sent;
 }
 
-// Patients a doctor asked to come back (same list as the Follow-ups page), from `days` before the follow-up date until the date itself.
+// Patients a doctor asked to come back (same list as the Follow-ups page, so not cancelled ones), from `days` before the follow-up date until the date itself.
 async function followUpReminders(h, set, today) {
   const q = await pool.query(
     `SELECT v.id AS visit_id,p.id AS patient_id,p.full_name,COALESCE(p.whatsapp_mobile,p.mobile) AS mobile,p.qr_code,
@@ -98,6 +98,7 @@ async function followUpReminders(h, set, today) {
      JOIN patients p ON p.hospital_id=v.hospital_id AND p.id=v.patient_id AND p.deleted_at IS NULL
      WHERE v.hospital_id=$1 AND v.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR') AND v.created_at > NOW() - INTERVAL '380 days'
        AND NOT EXISTS (SELECT 1 FROM visits v2 WHERE v2.hospital_id=v.hospital_id AND v2.patient_id=v.patient_id AND v2.id>v.id AND v2.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR'))
+       AND NOT EXISTS (SELECT 1 FROM follow_up_cancellations fc WHERE fc.hospital_id=v.hospital_id AND fc.visit_id=v.id)
      GROUP BY v.id,p.id`, [h.id]);
   const due = [];
   for (const r of q.rows) {
@@ -108,7 +109,7 @@ async function followUpReminders(h, set, today) {
   return sendEach(h, 'FOLLOWUP_REMINDER', due, today, (r) => [r.full_name, r.doctor_name, h.name, waDay(r.dueOn), phoneOf(h)]);
 }
 
-// Children and teenagers with a dose coming up (same working-out as the Vaccinations page), from `days` before the due date until it.
+// Children and teenagers with a dose coming up (same working-out as the Vaccines due page, so not cancelled doses), from `days` before the due date until it.
 // The template says "upcoming", so a dose already overdue is not sent. Never names the vaccine or the dose.
 async function vaccinationReminders(h, set, today) {
   const vs = await vaccinationSettings(pool, h.id);
@@ -117,12 +118,13 @@ async function vaccinationReminders(h, set, today) {
     `SELECT p.id,p.full_name,COALESCE(p.whatsapp_mobile,p.mobile) AS mobile,p.qr_code,to_char(p.date_of_birth,'YYYY-MM-DD') AS dob FROM patients p
      WHERE p.hospital_id=$1 AND p.deleted_at IS NULL AND p.date_of_birth IS NOT NULL AND p.date_of_birth >= $2::date`, [h.id, addDays(today, -19 * 365)]);
   if (!people.rowCount) return 0;
-  const [catalogue, recs] = await Promise.all([loadCatalogue(pool, h.id, { activeOnly: true }), recordsOf(pool, h.id, people.rows.map(p => Number(p.id)))]);
+  const ids = people.rows.map(p => Number(p.id));
+  const [catalogue, recs, cancelled] = await Promise.all([loadCatalogue(pool, h.id, { activeOnly: true }), recordsOf(pool, h.id, ids), cancelledDoses(pool, h.id, ids)]);
   const due = [];
   for (const p of people.rows) {
     if (!p.mobile) continue;
     const { items } = workOutSchedule({ dob: p.dob, vaccines: catalogue, records: recs.get(String(p.id)) || [], today });
-    const next = items.filter(i => i.kind === 'PENDING' && i.daysLeft >= 0).sort((a, b) => a.daysLeft - b.daysLeft)[0];
+    const next = items.filter(i => i.kind === 'PENDING' && i.daysLeft >= 0 && !cancelled.has(`${p.id}:${i.vaccineId}:${i.doseNo}`)).sort((a, b) => a.daysLeft - b.daysLeft)[0];
     if (!next || today < addDays(next.dueOn, -set.days)) continue;
     const adult = addDays(p.dob, 18 * 365 + 4) <= today;
     due.push({ ...p, patientId: Number(p.id), dueOn: next.dueOn, ref: `due:${next.dueOn}`, greeting: adult ? p.full_name : 'Parent / Guardian' });

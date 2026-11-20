@@ -42,6 +42,13 @@ export const recordsOf = async (db, hospitalId, patientIds) => {
   return m;
 };
 
+// Doses whose reminder was cancelled on the Vaccines due list: "patientId:vaccineId:doseNo". Not listed there, and no WhatsApp reminder.
+export const cancelledDoses = async (db, hospitalId, patientIds) => {
+  if (!patientIds.length) return new Set();
+  const q = await db.query(`SELECT patient_id,vaccine_id,dose_no FROM vaccine_due_cancellations WHERE hospital_id=$1 AND patient_id=ANY($2::bigint[])`, [hospitalId, patientIds]);
+  return new Set(q.rows.map(r => `${r.patient_id}:${r.vaccine_id}:${r.dose_no}`));
+};
+
 // ---- who can see what is switched on ----
 router.get('/status', asyncHandler(async (req, res) => { res.json(await readSettings(pool, req.user.hospitalId)); }));
 
@@ -354,12 +361,13 @@ router.get('/due', asyncHandler(async (req, res) => {
   const people = await pool.query(
     `SELECT p.id,p.full_name,p.mobile,COALESCE(p.whatsapp_mobile,p.mobile) AS whatsapp,to_char(p.date_of_birth,'YYYY-MM-DD') AS dob,p.dob_estimated FROM patients p
      WHERE p.hospital_id=$1 AND p.deleted_at IS NULL AND p.date_of_birth IS NOT NULL AND p.date_of_birth >= $2::date${doctorSql}`, params);
-  const [catalogue, recs] = await Promise.all([loadCatalogue(pool, hospitalId, { activeOnly: true }), recordsOf(pool, hospitalId, people.rows.map(p => Number(p.id)))]);
+  const ids = people.rows.map(p => Number(p.id));
+  const [catalogue, recs, cancelled] = await Promise.all([loadCatalogue(pool, hospitalId, { activeOnly: true }), recordsOf(pool, hospitalId, ids), cancelledDoses(pool, hospitalId, ids)]);
   const rows = [];
   const totals = { overdue: 0, week: 0, soon: 0 };
   for (const p of people.rows) {
     const { items } = workOutSchedule({ dob: p.dob, vaccines: catalogue, records: recs.get(String(p.id)) || [], today });
-    const due = items.filter(i => i.kind === 'PENDING' && (i.status === 'OVERDUE' || i.daysLeft <= days));
+    const due = items.filter(i => i.kind === 'PENDING' && (i.status === 'OVERDUE' || i.daysLeft <= days) && !cancelled.has(`${p.id}:${i.vaccineId}:${i.doseNo}`));
     if (!due.length) continue;
     const worst = Math.min(...due.map(i => i.daysLeft));
     if (worst < 0) totals.overdue += 1; else if (worst <= 7) totals.week += 1; else totals.soon += 1;
@@ -372,6 +380,33 @@ router.get('/due', asyncHandler(async (req, res) => {
   const called = await sentMap(pool, hospitalId, 'VACCINE_CALL', rows.map(r => r.patientId));
   for (const r of rows) { r.reminderRef = r.doses[0].dueOn; r.reminder = sent.get(`${r.patientId}:${r.reminderRef}`) || null; r.call = called.get(`${r.patientId}:${r.reminderRef}`) || null; }
   res.json({ ...settings, days, totals, total: rows.length, rows: rows.slice(0, 500) });
+}));
+
+// Cancel the reminder for the doses shown on a Vaccines due row (for example: parent declined, doctor advised to wait).
+// The vaccination record is not changed; the doses stay pending on the patient's Vaccines tab. Kept with who, when and why.
+// Admin and Receptionist can cancel for any patient; a doctor for patients they have treated (the ones on their list).
+router.post('/due/:patientId/cancel', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (req, res) => {
+  const hospitalId = req.user.hospitalId;
+  const patientId = z.coerce.number().int().positive().parse(req.params.patientId);
+  const { doses, reason } = z.object({
+    doses: z.array(z.object({ vaccineId: z.number().int().positive(), doseNo: z.number().int().min(1).max(50) })).min(1).max(60),
+    reason: z.string().trim().max(300).optional(),
+  }).parse(req.body || {});
+  const p = await pool.query(`SELECT 1 FROM patients WHERE hospital_id=$1 AND id=$2 AND deleted_at IS NULL`, [hospitalId, patientId]);
+  if (!p.rowCount) throw notFound('This patient was not found. Please refresh the page.');
+  if (req.user.role === 'DOCTOR') {
+    const seen = await pool.query(`SELECT 1 FROM visits v JOIN visit_doctors vd ON vd.hospital_id=v.hospital_id AND vd.visit_id=v.id WHERE v.hospital_id=$1 AND v.patient_id=$2 AND vd.doctor_id=$3 LIMIT 1`, [hospitalId, patientId, req.user.id]);
+    if (!seen.rowCount) throw badRequest('You can cancel only for patients you have treated.');
+  }
+  const known = await pool.query(`SELECT vaccine_id,dose_no FROM vaccine_schedule WHERE hospital_id=$1 AND vaccine_id=ANY($2::bigint[])`, [hospitalId, doses.map(d => d.vaccineId)]);
+  const ok = new Set(known.rows.map(r => `${r.vaccine_id}:${r.dose_no}`));
+  if (doses.some(d => !ok.has(`${d.vaccineId}:${d.doseNo}`))) throw badRequest('The vaccine schedule has changed. Please refresh the page.');
+  await pool.query(
+    `INSERT INTO vaccine_due_cancellations(hospital_id,patient_id,vaccine_id,dose_no,reason,cancelled_by)
+     SELECT $1,$2,d.vaccine_id,d.dose_no,$5,$6 FROM unnest($3::bigint[],$4::smallint[]) AS d(vaccine_id,dose_no)
+     ON CONFLICT (hospital_id,patient_id,vaccine_id,dose_no) DO NOTHING`,
+    [hospitalId, patientId, doses.map(d => d.vaccineId), doses.map(d => d.doseNo), reason || null, req.user.id]);
+  res.json({ ok: true, cancelled: doses.length });
 }));
 
 export default router;

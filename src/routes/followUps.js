@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { pool } from '../db.js';
 import { allow } from '../middleware/auth.js';
-import { asyncHandler } from '../utils.js';
+import { asyncHandler, badRequest, notFound } from '../utils.js';
 import { sentMap } from './reminders.js';
 import { addDays, daysBetween, todayIst } from '../vaccination.js';
 
@@ -43,6 +43,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
      WHERE v.hospital_id=$1 AND v.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR')${doctorSql}
        AND v.created_at > NOW() - INTERVAL '546 days' -- a follow-up is at most 365 days after the visit and is dropped 180 days after it is due, so older visits can never be listed (keeps this fast as years pass)
        AND NOT EXISTS (SELECT 1 FROM visits v2 WHERE v2.hospital_id=v.hospital_id AND v2.patient_id=v.patient_id AND v2.id>v.id AND v2.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR'))
+       AND NOT EXISTS (SELECT 1 FROM follow_up_cancellations fc WHERE fc.hospital_id=v.hospital_id AND fc.visit_id=v.id)
      GROUP BY v.id,p.id`, params);
   const totals = { overdue: 0, week: 0, soon: 0 };
   const rows = [];
@@ -59,6 +60,23 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
   const called = await sentMap(pool, hospitalId, 'FOLLOW_UP_CALL', rows.map(r => r.patientId));
   for (const r of rows) { r.reminder = sent.get(`${r.patientId}:${r.visitId}`) || null; r.call = called.get(`${r.patientId}:${r.visitId}`) || null; }
   res.json({ days, totals, total: rows.length, rows: rows.slice(0, 500), ...(await readMessage(hospitalId)) });
+}));
+
+// Cancel a follow-up (for example: will not come back, went elsewhere). The doctor's visit record is not changed;
+// the cancellation is kept with who, when and why, and the automatic WhatsApp follow-up reminder is not sent for it.
+// Admin and Receptionist can cancel any follow-up; a doctor only one they advised.
+router.post('/:visitId/cancel', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (req, res) => {
+  const visitId = z.coerce.number().int().positive().parse(req.params.visitId);
+  const { reason } = z.object({ reason: z.string().trim().max(300).optional() }).parse(req.body || {});
+  const q = await pool.query(
+    `SELECT BOOL_OR(vd.doctor_id=$3) AS mine FROM visits v JOIN visit_doctors vd ON vd.hospital_id=v.hospital_id AND vd.visit_id=v.id AND vd.follow_up_days IS NOT NULL
+     WHERE v.hospital_id=$1 AND v.id=$2`, [req.user.hospitalId, visitId, req.user.id]);
+  if (q.rows[0]?.mine == null) throw notFound('This follow-up was not found. Please refresh the page.');
+  if (req.user.role === 'DOCTOR' && !q.rows[0].mine) throw badRequest('You can cancel only the follow-ups you advised.');
+  await pool.query(
+    `INSERT INTO follow_up_cancellations(hospital_id,visit_id,reason,cancelled_by) VALUES($1,$2,$3,$4) ON CONFLICT (hospital_id,visit_id) DO NOTHING`,
+    [req.user.hospitalId, visitId, reason || null, req.user.id]);
+  res.json({ ok: true });
 }));
 
 export default router;
