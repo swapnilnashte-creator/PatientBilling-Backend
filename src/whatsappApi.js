@@ -50,6 +50,9 @@ export const TEMPLATES = {
   APPOINTMENT_REMINDER: 'dhacare_appointment_reminder',         // same values and button as the confirmation
   FOLLOWUP_REMINDER: 'dhacare_followup_reminder',               // patient, doctor, clinic, date, clinic phone; button: patients.qr_code
   VACCINATION_REMINDER: 'dhacare_vaccination_reminder',         // greeting name, clinic, patient, due date, clinic phone; button: patients.qr_code
+  // diet clients: no weight or plan in the text, only a fixed button to https://dhacare.com/my-diet (no {{1}} in the button)
+  DIET_WEIGHT_REMINDER: 'dhacare_diet_update_reminder',         // client name, clinic, days without an update, clinic phone
+  DIET_PLAN_SHARED: 'dhacare_diet_plan_shared',                 // client name, dietitian, clinic, plan from DD/MM/YYYY, plan to DD/MM/YYYY, clinic phone
 };
 
 // Meta refuses a value with a line break, a tab or more than 4 spaces in a row, and an empty one. * _ ~ would change the bold in the text.

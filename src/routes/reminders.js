@@ -5,7 +5,7 @@ import { allow } from '../middleware/auth.js';
 import { asyncHandler, notFound } from '../utils.js';
 
 const router = Router();
-const body = z.object({ kind: z.enum(['FOLLOW_UP', 'VACCINE', 'FOLLOW_UP_CALL', 'VACCINE_CALL']), patientId: z.coerce.number().int().positive(), ref: z.string().trim().min(1).max(40) });
+const body = z.object({ kind: z.enum(['FOLLOW_UP', 'VACCINE', 'FOLLOW_UP_CALL', 'VACCINE_CALL', 'DIET_WEIGHT']), patientId: z.coerce.number().int().positive(), ref: z.string().trim().min(1).max(40) });
 
 // Who has already been sent a reminder: the list pages call this to colour the WhatsApp button.
 export async function sentMap(db, hospitalId, kind, patientIds) {

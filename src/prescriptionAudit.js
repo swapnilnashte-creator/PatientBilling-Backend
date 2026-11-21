@@ -48,3 +48,25 @@ export async function recordPrescriptionChanges(client, { hospitalId, visit, use
     }
   }
 }
+
+// Tests advised (visit_test_items) go in the same record: a test added or removed. A test has nothing to change, so there is no CHANGED.
+// Adding a test and taking it off again within a minute or two (a mis-tap) by the same person cancels out instead of leaving two lines.
+const testKey = (name) => `t:${String(name).trim().toLowerCase()}`;
+export async function recordTestChanges(client, { hospitalId, visit, user, before, after }) {
+  const old = new Map(before.map(r => [testKey(r.name), r.name]));
+  const next = new Map(after.map(t => [testKey(t.name), t.name]));
+  const record = async (action, key, name) => {
+    const last = (await client.query(
+      `SELECT id,action FROM prescription_audit WHERE hospital_id=$1 AND visit_id=$2 AND item_key=$3 AND changed_by=$4 AND created_at > NOW() - make_interval(mins=>$5::int)
+       ORDER BY id DESC LIMIT 1`, [hospitalId, visit.id, key, user.id, MERGE_MINUTES])).rows[0];
+    if (last && last.action !== action) { await client.query(`DELETE FROM prescription_audit WHERE id=$1`, [last.id]); return; }
+    const data = JSON.stringify({ kind: 'TEST', name });
+    await client.query(
+      `INSERT INTO prescription_audit(hospital_id,visit_id,patient_id,doctor_id,action,item_key,medicine_id,name,before_data,after_data,changed_fields,changed_by,changed_by_name,changed_by_role,by_support,visit_status)
+       VALUES($1,$2,$3,$4,$5,$6,NULL,$7,$8,$9,'{}',$10,$11,$12,$13,$14)`,
+      [hospitalId, visit.id, visit.patient_id, visit.doctor_id, action, key, name, action === 'REMOVED' ? data : null, action === 'ADDED' ? data : null,
+        user.id, user.name || 'Unknown', user.role, Boolean(user.impersonatedBySuperuserId), visit.status]);
+  };
+  for (const [key, name] of old) if (!next.has(key)) await record('REMOVED', key, name);
+  for (const [key, name] of next) if (!old.has(key)) await record('ADDED', key, name);
+}

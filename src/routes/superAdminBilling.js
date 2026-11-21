@@ -610,9 +610,10 @@ router.post('/whatsapp-sending', asyncHandler(async (req, res) => {
 
 // DhaCare's default reminder times, for every hospital that has not chosen its own. Reason required, audited.
 router.put('/reminder-defaults', asyncHandler(async (req, res) => {
-  const body = timesSchema.extend({ reason: z.string().trim().min(5).max(500) }).parse(req.body);
-  const { reason, ...times } = body;
   const before = await reminderDefaults();
+  // a request without the diet weight reminder keeps its current default
+  const body = timesSchema.extend({ reason: z.string().trim().min(5).max(500) }).parse({ weight: before.weight, ...req.body });
+  const { reason, ...times } = body;
   if (JSON.stringify(before) === JSON.stringify(times)) throw badRequest('These are already the default reminder times');
   await withTransaction(async (client) => {
     await client.query(`UPDATE platform_whatsapp SET reminder_defaults=$1 WHERE id=1`, [JSON.stringify(times)]);

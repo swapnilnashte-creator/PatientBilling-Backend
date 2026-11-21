@@ -1,4 +1,4 @@
-// Automatic WhatsApp reminders through Meta: appointment, follow-up and vaccination.
+// Automatic WhatsApp reminders through Meta: appointment, follow-up, vaccination, and a diet client's missing weight.
 // When: DhaCare's default times (Super Admin, Pricing > WhatsApp messages), or the hospital's own (Hospital Settings > WhatsApp >
 // Automatic messages), where each reminder is off until the hospital turns it on. Who: only hospitals with WhatsApp messages on (all switches, see whatsappApi.js).
 // A timer checks every 10 minutes, between 7 AM and 9 PM India time only. Each reminder is sent once (whatsapp_messages.ref).
@@ -9,18 +9,20 @@ import { sendWhatsApp, waClock, waDay, whatsappConfigured, whatsappPlatformOn } 
 import { addDays, workOutSchedule } from './vaccination.js';
 import { cancelledDoses, loadCatalogue, readSettings as vaccinationSettings, recordsOf } from './routes/vaccines.js';
 
-export const KINDS = ['appointment', 'followUp', 'vaccination'];
+export const KINDS = ['appointment', 'followUp', 'vaccination', 'weight'];
 export const QUIET = { from: 21, to: 7 }; // nothing is sent from 9 PM to 7 AM
-const FALLBACK = { appointment: { hours: 24 }, followUp: { days: 1, hour: 10 }, vaccination: { days: 2, hour: 10 } };
+const FALLBACK = { appointment: { hours: 24 }, followUp: { days: 1, hour: 10 }, vaccination: { days: 2, hour: 10 }, weight: { days: 2, hour: 10 } };
 
 // The times: appointment = hours before (1 hour to 7 days); follow-up and vaccination = days before (0 = on the day), at an hour from 7 AM to 8 PM.
 const dayTimes = z.object({ days: z.number().int().min(0).max(14), hour: z.number().int().min(QUIET.to).max(QUIET.from - 1) });
-export const timesSchema = z.object({ appointment: z.object({ hours: z.number().int().min(1).max(168) }), followUp: dayTimes, vaccination: dayTimes });
+// weight: a diet client with no weight for `days` days (1 to 14) is reminded once, at the hour, with the link to their My diet page.
+const weightTimes = z.object({ days: z.number().int().min(1).max(14), hour: z.number().int().min(QUIET.to).max(QUIET.from - 1) });
+export const timesSchema = z.object({ appointment: z.object({ hours: z.number().int().min(1).max(168) }), followUp: dayTimes, vaccination: dayTimes, weight: weightTimes });
 
 export async function reminderDefaults(db = pool) {
   let d = null;
   try { d = (await db.query(`SELECT reminder_defaults FROM platform_whatsapp WHERE id=1`)).rows[0]?.reminder_defaults; } catch { /* the table is missing: built-in times */ }
-  const ok = timesSchema.safeParse(d);
+  const ok = timesSchema.safeParse(d && typeof d === 'object' ? { ...FALLBACK, ...d } : d);
   return ok.success ? ok.data : FALLBACK;
 }
 
@@ -132,6 +134,29 @@ async function vaccinationReminders(h, set, today) {
   return sendEach(h, 'VACCINATION_REMINDER', due, today, (r) => [r.greeting, h.name, r.full_name, waDay(r.dueOn), phoneOf(h)]);
 }
 
+// Diet clients on a running programme with no weight for `days` days (counted from the last weight, or from the start when there is none).
+// Sent once for each gap: a new weight starts a new count. Only in a clinic with an active dietitian. The message has no weight or plan in it,
+// only a button to the client's own My diet page (mobile number + robot check there).
+async function weightReminders(h, set, today) {
+  const q = await pool.query(
+    `SELECT p.id AS programme_id,pt.id AS patient_id,pt.full_name,COALESCE(pt.whatsapp_mobile,pt.mobile) AS mobile,
+            to_char(COALESCE((SELECT MAX(w.on_date) FROM weight_log w WHERE w.hospital_id=p.hospital_id AND w.patient_id=p.patient_id AND w.on_date>=p.start_date), p.start_date),'YYYY-MM-DD') AS last_on
+     FROM diet_programmes p JOIN patients pt ON pt.id=p.patient_id AND pt.hospital_id=p.hospital_id AND pt.deleted_at IS NULL
+     WHERE p.hospital_id=$1 AND p.status='ACTIVE' AND p.start_date<=$2::date
+       AND EXISTS (SELECT 1 FROM users u WHERE u.hospital_id=p.hospital_id AND u.id=p.doctor_id AND u.speciality='DIETITIAN' AND u.is_active=TRUE AND u.deleted_at IS NULL)`, [h.id, today]);
+  const gap = (from) => Math.round((Date.parse(`${today}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000);
+  const due = q.rows.filter(r => r.mobile && gap(r.last_on) >= set.days).map(r => ({ ...r, patientId: Number(r.patient_id), days: gap(r.last_on), ref: `weight:${r.programme_id}:${r.last_on}` }));
+  if (!due.length) return 0;
+  const sentBefore = await alreadySent(h.id, 'DIET_WEIGHT_REMINDER', due);
+  let sent = 0;
+  for (const r of due) {
+    if (sentBefore.has(`${r.patientId}:${r.ref}`)) continue;
+    const res = await sendWhatsApp({ hospitalId: h.id, patientId: r.patientId, ref: r.ref, kind: 'DIET_WEIGHT_REMINDER', toMobile: r.mobile, body: [r.full_name, h.name, String(r.days), phoneOf(h)] });
+    if (res === 'SENT') sent += 1;
+  }
+  return sent;
+}
+
 async function sendEach(h, kind, due, today, body) {
   if (!due.length) return 0;
   const [sentBefore, booked] = await Promise.all([alreadySent(h.id, kind, due), alreadyBooked(h.id, today, due)]);
@@ -151,7 +176,7 @@ export const forgetReminderDays = (hospitalId = null) => { if (hospitalId === nu
 
 // One check. now and onlyHospital are for tests. Answers what was sent; never throws.
 export async function runReminders({ now = new Date(), onlyHospital = null } = {}) {
-  const result = { appointment: 0, followUp: 0, vaccination: 0 };
+  const result = { appointment: 0, followUp: 0, vaccination: 0, weight: 0 };
   const hour = istHour(now);
   if (hour >= QUIET.from || hour < QUIET.to) return { ...result, quiet: true };
   if (!whatsappConfigured() || !(await whatsappPlatformOn())) return { ...result, paused: true };
@@ -169,7 +194,8 @@ export async function runReminders({ now = new Date(), onlyHospital = null } = {
       for (const h of hospitals.rows) {
         const set = effectiveReminders(h.whatsapp_reminders, defaults);
         for (const [kind, run] of [['appointment', () => appointmentReminders(h, set.appointment.hours, now)],
-          ['followUp', () => followUpReminders(h, set.followUp, today)], ['vaccination', () => vaccinationReminders(h, set.vaccination, today)]]) {
+          ['followUp', () => followUpReminders(h, set.followUp, today)], ['vaccination', () => vaccinationReminders(h, set.vaccination, today)],
+          ['weight', () => weightReminders(h, set.weight, today)]]) {
           if (!set[kind].on) continue;
           const daily = kind !== 'appointment';
           if (daily && (hour < set[kind].hour || doneToday.get(`${h.id}:${kind}`) === today)) continue;
@@ -188,8 +214,8 @@ export async function runReminders({ now = new Date(), onlyHospital = null } = {
 
 export function startReminderTimer() {
   const tick = () => runReminders().then(r => {
-    const n = r.appointment + r.followUp + r.vaccination;
-    if (n) console.log(`WhatsApp reminders sent: ${r.appointment} appointment, ${r.followUp} follow-up, ${r.vaccination} vaccination`);
+    const n = r.appointment + r.followUp + r.vaccination + r.weight;
+    if (n) console.log(`WhatsApp reminders sent: ${r.appointment} appointment, ${r.followUp} follow-up, ${r.vaccination} vaccination, ${r.weight} diet weight`);
   }).catch(err => logError(err, { source: 'whatsapp reminders' }));
   setTimeout(tick, 60 * 1000).unref();
   setInterval(tick, 10 * 60 * 1000).unref();

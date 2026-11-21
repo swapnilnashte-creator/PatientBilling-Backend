@@ -114,9 +114,10 @@ router.put('/whatsapp', asyncHandler(async (req, res) => {
 // The hospital's own reminder times, and each reminder on or off. Times equal to DhaCare's defaults are not kept, so later default changes apply.
 const dayChoice = z.object({ on: z.boolean(), days: z.number().int(), hour: z.number().int() });
 router.put('/whatsapp/reminders', asyncHandler(async (req, res) => {
-  const d = z.object({ appointment: z.object({ on: z.boolean(), hours: z.number().int() }), followUp: dayChoice, vaccination: dayChoice }).parse(req.body);
+  const d = z.object({ appointment: z.object({ on: z.boolean(), hours: z.number().int() }), followUp: dayChoice, vaccination: dayChoice, weight: dayChoice.optional() }).parse(req.body);
+  if (!d.weight) d.weight = { on: false, ...(await reminderDefaults()).weight }; // a screen without the diet reminder leaves it off
   const times = timesSchema.safeParse(d);
-  if (!times.success) throw badRequest('Choose 1 hour to 7 days before an appointment, and 0 to 14 days before, between 7 AM and 8 PM, for the other reminders.');
+  if (!times.success) throw badRequest('Choose 1 hour to 7 days before an appointment, and 0 to 14 days before, between 7 AM and 8 PM, for the other reminders (1 to 14 days without a weight for the diet reminder).');
   const stored = remindersToStore(d, await reminderDefaults());
   await pool.query(`UPDATE hospitals SET whatsapp_reminders=$2,updated_at=NOW() WHERE id=$1`, [req.user.hospitalId, stored ? JSON.stringify(stored) : null]);
   forgetReminderDays(Number(req.user.hospitalId)); // the next check looks at this hospital's lists again today

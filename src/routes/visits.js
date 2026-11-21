@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { pool, withTransaction } from '../db.js';
 import { allow } from '../middleware/auth.js';
 import { asyncHandler, badRequest, forbidden, money, notFound } from '../utils.js';
-import { recordPrescriptionChanges } from '../prescriptionAudit.js';
+import { recordPrescriptionChanges, recordTestChanges } from '../prescriptionAudit.js';
+import { labTestByCode } from '../labTests.js';
 import { dietPackageForVisit, syncVisitWeight } from './diet.js';
 
 const router = Router();
@@ -92,7 +93,7 @@ async function getCorrections(client, hospitalId, visitId) {
 
 async function getVisitDoctors(client, hospitalId, visitId) {
   const q = await client.query(
-    `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,u.qualification AS doctor_qualification,u.registration_no AS doctor_registration_no,vd.position,vd.status,
+    `SELECT vd.id,vd.doctor_id,u.name AS doctor_name,u.qualification AS doctor_qualification,u.registration_no AS doctor_registration_no,u.speciality AS doctor_speciality,vd.position,vd.status,
             vd.doctor_notes,vd.advice,vd.follow_up_days,vd.started_at,vd.completed_at,vd.skipped_at,vd.skipped_by,vd.skip_reason
      FROM visit_doctors vd
      JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
@@ -111,6 +112,17 @@ async function getPrescription(client, hospitalId, visitId) {
      JOIN users u ON u.id=pi.doctor_id AND u.hospital_id=pi.hospital_id
      WHERE pi.hospital_id=$1 AND pi.visit_id=$2
      ORDER BY pi.doctor_id,pi.position`,
+    [hospitalId, visitId]
+  );
+  return q.rows;
+}
+
+// Tests advised on this visit, each doctor's in the order they added them (part of the prescription).
+async function getTests(client, hospitalId, visitId) {
+  const q = await client.query(
+    `SELECT ti.id,ti.doctor_id,u.name AS doctor_name,ti.position,ti.test_code,ti.name
+     FROM visit_test_items ti JOIN users u ON u.id=ti.doctor_id AND u.hospital_id=ti.hospital_id
+     WHERE ti.hospital_id=$1 AND ti.visit_id=$2 ORDER BY ti.doctor_id,ti.position`,
     [hospitalId, visitId]
   );
   return q.rows;
@@ -434,9 +446,10 @@ router.get('/:id', asyncHandler(async (req, res) => {
   const doctors = await getVisitDoctors(client, req.user.hospitalId, req.params.id);
   const settlement = await getSettlementBreakdown(client, req.user.hospitalId, req.params.id);
   const prescription = await getPrescription(client, req.user.hospitalId, req.params.id);
+  const tests = await getTests(client, req.user.hospitalId, req.params.id);
   const handwriting = await getHandwriting(client, req.user.hospitalId, req.params.id);
   const dietPackage = await dietPackageForVisit(client, req.user.hospitalId, visit);
-  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription, handwriting, dietPackage });
+  res.json({ visit, doctors, charges, payment: payment.rows[0] || null, corrections, settlement, prescription, tests, handwriting, dietPackage });
 }));
 
 // The most recent earlier prescription for this visit's patient (offered as "copy to this visit").
@@ -446,13 +459,15 @@ router.get('/:id/prescription/last', asyncHandler(async (req, res) => {
   const last = await pool.query(
     `SELECT v.id,v.created_at FROM visits v
      WHERE v.hospital_id=$1 AND v.patient_id=$2 AND v.id<>$3 AND v.created_at<=$4
-       AND EXISTS (SELECT 1 FROM visit_prescription_items pi WHERE pi.hospital_id=v.hospital_id AND pi.visit_id=v.id)
+       AND (EXISTS (SELECT 1 FROM visit_prescription_items pi WHERE pi.hospital_id=v.hospital_id AND pi.visit_id=v.id)
+            OR EXISTS (SELECT 1 FROM visit_test_items ti WHERE ti.hospital_id=v.hospital_id AND ti.visit_id=v.id))
      ORDER BY v.created_at DESC,v.id DESC LIMIT 1`,
     [req.user.hospitalId, visit.patient_id, visit.id, visit.created_at]
   );
   if (!last.rowCount) return res.json(null);
   const items = await getPrescription(pool, req.user.hospitalId, last.rows[0].id);
-  res.json({ visitId: Number(last.rows[0].id), date: last.rows[0].created_at, doctorName: items[0]?.doctor_name, items });
+  const tests = await getTests(pool, req.user.hospitalId, last.rows[0].id);
+  res.json({ visitId: Number(last.rows[0].id), date: last.rows[0].created_at, doctorName: (items[0] || tests[0])?.doctor_name, items, tests });
 }));
 
 const prescriptionItemSchema = z.object({
@@ -466,11 +481,21 @@ const prescriptionItemSchema = z.object({
   durationDays: z.coerce.number().int().min(1).max(365).nullable().optional(),
   note: z.string().trim().max(200).optional().default(''),
 });
+// A test advised: a code from the list of common tests (labTests.js), or only a name for a test the doctor typed in.
+const testItemSchema = z.object({
+  code: z.string().trim().max(40).nullable().optional(),
+  name: z.string().trim().min(1).max(160),
+});
+const sameTest = (a, b) => String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
 
-// Replaces the consulting doctor's medicine list for this visit (the screen saves the whole list as it changes).
+// Replaces the consulting doctor's medicine list for this visit (the screen saves the whole list as it changes), and their tests advised when
+// `tests` is sent (left out = the tests stay as they are).
 // The assigned doctor or the hospital admin (who runs the consultation screen in small clinics) can edit it; it is always stored under the consulting doctor.
 router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req, res) => {
-  const data = z.object({ items: z.array(prescriptionItemSchema).max(30) }).parse(req.body);
+  const data = z.object({ items: z.array(prescriptionItemSchema).max(30), tests: z.array(testItemSchema).max(30).optional() }).parse(req.body);
+  // a test from the list always keeps the list's name; the same test twice is kept once
+  const tests = data.tests ? data.tests.map(t => { const known = labTestByCode(t.code); return { code: known ? known.code : null, name: known ? known.name : t.name }; })
+    .filter((t, i, all) => all.findIndex(o => sameTest(o.name, t.name)) === i) : null;
   const result = await withTransaction(async (client) => {
     const visit = await getVisit(client, req.user.hospitalId, req.params.id, true);
     if (req.user.role === 'DOCTOR' && Number(visit.doctor_id) !== req.user.id) throw forbidden('This visit is assigned to another doctor');
@@ -497,9 +522,28 @@ router.put('/:id/prescription', allow('ADMIN','DOCTOR'), asyncHandler(async (req
         [req.user.hospitalId, visit.id, visit.doctor_id, index + 1, item.medicineId || null, item.name, item.composition, item.manufacturer, item.packSize, item.dose, item.timing, item.durationDays || null, item.note]
       );
     }
-    return getPrescription(client, req.user.hospitalId, visit.id);
+    if (tests) {
+      // a test another doctor already advised on this visit is not advised again
+      const otherTests = await client.query(
+        `SELECT ti.name,u.name AS doctor_name FROM visit_test_items ti JOIN users u ON u.id=ti.doctor_id AND u.hospital_id=ti.hospital_id
+         WHERE ti.hospital_id=$1 AND ti.visit_id=$2 AND ti.doctor_id<>$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
+      for (const t of tests) {
+        const taken = otherTests.rows.find(o => sameTest(o.name, t.name));
+        if (taken) throw badRequest(`${t.name} is already advised by ${taken.doctor_name} in this visit, so it cannot be added again.`);
+      }
+      const beforeTests = await client.query(`SELECT name FROM visit_test_items WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
+      await recordTestChanges(client, { hospitalId: req.user.hospitalId, visit, user: req.user, before: beforeTests.rows, after: tests });
+      await client.query(`DELETE FROM visit_test_items WHERE hospital_id=$1 AND visit_id=$2 AND doctor_id=$3`, [req.user.hospitalId, visit.id, visit.doctor_id]);
+      if (tests.length) {
+        await client.query(
+          `INSERT INTO visit_test_items(hospital_id,visit_id,doctor_id,position,test_code,name)
+           SELECT $1,$2,$3,t.pos,t.code,t.name FROM unnest($4::text[],$5::text[]) WITH ORDINALITY AS t(code,name,pos)`,
+          [req.user.hospitalId, visit.id, visit.doctor_id, tests.map(t => t.code), tests.map(t => t.name)]);
+      }
+    }
+    return { prescription: await getPrescription(client, req.user.hospitalId, visit.id), tests: await getTests(client, req.user.hospitalId, visit.id) };
   });
-  res.json({ prescription: result });
+  res.json(result);
 }));
 
 // Handwriting (pen tablet or stylus): the pen strokes of the consulting doctor for this visit. A stroke is { p: [[x, y, pressure], ...] } on a sheet 1000 units wide.

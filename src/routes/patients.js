@@ -86,6 +86,10 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
   const totalVisitsSql = (a) => `(SELECT COUNT(*)::int FROM visits a WHERE a.hospital_id=${a}.hospital_id AND a.patient_id=${a}.id AND a.status<>'CANCELLED') AS total_visits`;
   // diet package money counts only while the hospital has a dietitian
   const dietOn = await hospitalHasDietitian(pool, req.user.hospitalId);
+  // diet=1: only patients on a running diet programme (the "Diet clients" filter); each row also says whether the patient is on one
+  const runningDiet = (a) => `SELECT dp.status FROM diet_programmes dp WHERE dp.hospital_id=${a}.hospital_id AND dp.patient_id=${a}.id AND dp.status<>'COMPLETED'`;
+  const dietOnly = dietOn && String(req.query.diet || '') === '1';
+  const dietSql = dietOnly ? ` AND EXISTS (${runningDiet('p')})` : '';
   const pkgDoctor = isDoctor ? ` AND k.doctor_id=$${doctorParam}` : '';
   const pkJoin = dietOn ? `LEFT JOIN (SELECT k.patient_id,SUM(k.amount) AS fee,COALESCE(SUM(pp.paid),0) AS paid FROM diet_packages k
                   LEFT JOIN (SELECT package_id,SUM(amount) AS paid FROM diet_package_payments WHERE hospital_id=$1 GROUP BY package_id) pp ON pp.package_id=k.id
@@ -109,7 +113,7 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
          WHERE v.hospital_id=$1 AND v.status<>'CANCELLED'${rangeSql}${searchVisitsSql}
          GROUP BY v.patient_id
        ) s ON s.patient_id=p.id
-       WHERE p.hospital_id=$1 AND p.deleted_at IS NULL${searchSql}
+       WHERE p.hospital_id=$1 AND p.deleted_at IS NULL${searchSql}${dietSql}
      ), page AS (
        SELECT t.*,COUNT(*) OVER()::int AS total FROM base t
        WHERE (t.visits>0${includeNoVisits ? ' OR TRUE' : ''})${owes ? ' AND t.outstanding>0' : ''}
@@ -124,7 +128,8 @@ router.get('/', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandler(async (re
             ${isDoctor ? `(SELECT json_build_object('days', vd.follow_up_days, 'visitOn', to_char(a.created_at AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD'), 'visitId', a.id) FROM visit_doctors vd JOIN visits a ON a.hospital_id=vd.hospital_id AND a.id=vd.visit_id
               WHERE a.hospital_id=t.hospital_id AND a.patient_id=t.id AND vd.doctor_id=$${doctorParam} AND vd.follow_up_days IS NOT NULL AND a.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR')
                 AND NOT EXISTS (SELECT 1 FROM visits b WHERE b.hospital_id=a.hospital_id AND b.patient_id=a.patient_id AND b.id>a.id AND b.status NOT IN ('CANCELLED','LEFT_BEFORE_DOCTOR'))
-              ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::json'} AS follow_up
+              ORDER BY a.created_at DESC LIMIT 1)` : 'NULL::json'} AS follow_up,
+            ${dietOn ? `(${runningDiet('t')} ORDER BY dp.id DESC LIMIT 1)` : 'NULL::text'} AS diet_status
      FROM page t
      ORDER BY ${orderBy},lower(t.full_name),t.id`,
     params
@@ -239,7 +244,7 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
   const ids = visits.map(v => v.id);
   const by = (rows) => { const m = new Map(); for (const r of rows) { const k = String(r.visit_id); if (!m.has(k)) m.set(k, []); m.get(k).push(r); } return m; };
   const none = { rows: [] };
-  const [doctorsQ, rxQ, chargesQ, payQ, certQ] = ids.length ? await Promise.all([
+  const [doctorsQ, rxQ, chargesQ, payQ, certQ, testsQ] = ids.length ? await Promise.all([
     pool.query(
       `SELECT vd.visit_id,vd.doctor_id,u.name AS doctor_name,u.qualification,vd.position,vd.status,vd.doctor_notes,vd.advice,vd.follow_up_days,vd.completed_at
        FROM visit_doctors vd JOIN users u ON u.id=vd.doctor_id AND u.hospital_id=vd.hospital_id
@@ -260,8 +265,12 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
       `SELECT c.visit_id,c.number,c.title,c.type_key,c.status,c.issued_at,c.cancel_reason,du.name AS doctor_name
        FROM certificates c LEFT JOIN users du ON du.id=c.doctor_id AND du.hospital_id=c.hospital_id
        WHERE c.hospital_id=$1 AND c.visit_id=ANY($2::bigint[]) ORDER BY c.issued_at`, [hospitalId, ids]),
-  ]) : [none, none, none, none, none];
-  const doctors = by(doctorsQ.rows); const rx = by(rxQ.rows); const charges = by(chargesQ.rows); const pays = by(payQ.rows); const certs = by(certQ.rows);
+    clinical ? pool.query(
+      `SELECT ti.visit_id,ti.name,u.name AS doctor_name
+       FROM visit_test_items ti JOIN users u ON u.id=ti.doctor_id AND u.hospital_id=ti.hospital_id
+       WHERE ti.hospital_id=$1 AND ti.visit_id=ANY($2::bigint[]) ORDER BY ti.visit_id,ti.doctor_id,ti.position`, [hospitalId, ids]) : none,
+  ]) : [none, none, none, none, none, none];
+  const doctors = by(doctorsQ.rows); const rx = by(rxQ.rows); const tests = by(testsQ.rows); const charges = by(chargesQ.rows); const pays = by(payQ.rows); const certs = by(certQ.rows);
 
   const out = visits.map((v, vi) => {
     const k = String(v.id);
@@ -281,6 +290,7 @@ router.get('/:id/overview', allow('ADMIN', 'RECEPTIONIST', 'DOCTOR'), asyncHandl
     if (clinical) {
       row.vitals = { weight_kg: v.weight_kg, height_cm: v.height_cm, heart_rate: v.heart_rate, spo2: v.spo2, temperature: v.temperature, temperature_unit: v.temperature_unit, bp_systolic: v.bp_systolic, bp_diastolic: v.bp_diastolic };
       row.prescription = (rx.get(k) || []).map(r => ({ name: r.name, composition: r.composition, dose: r.dose, timing: r.timing, days: r.duration_days, note: r.note, doctorName: r.doctor_name }));
+      row.tests = (tests.get(k) || []).map(r => ({ name: r.name, doctorName: r.doctor_name }));
     }
     if (money) {
       row.bill = { items, total: Math.round(billed * 100) / 100, unpaid, payment: pay ? { amount: Number(pay.amount), mode: pay.payment_mode, reference: pay.reference_no, paidAt: pay.paid_at, acceptedBy: pay.accepted_by } : null };

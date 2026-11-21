@@ -17,13 +17,18 @@ const isProduction = () => process.env.NODE_ENV === 'production';
 
 // What a new hospital starts with; the Admin changes the list in Hospital Settings. Severity: LOW normal, MEDIUM moderate, HIGH urgent.
 export const DEFAULT_REASONS = [['Fever', 'MEDIUM'], ['Cold or cough', 'LOW'], ['Stomach pain', 'MEDIUM'], ['Vomiting or loose motions', 'MEDIUM'], ['Headache', 'LOW'], ['Body pain', 'LOW'], ['Skin problem', 'LOW'], ['Injury', 'HIGH'], ['Vaccination', 'LOW'], ['Follow-up visit', 'LOW'], ['Routine check-up', 'LOW'], ['Report review', 'LOW']];
-export const SEVERITY_RANK = { LOW: 1, MEDIUM: 2, HIGH: 3 };
+// A clinic whose only doctors are dietitians starts with diet reasons instead.
+export const DIET_REASONS = [['Weight loss', 'LOW'], ['Weight gain', 'LOW'], ['Diabetes diet', 'LOW'], ['Thyroid or PCOS diet', 'LOW'], ['Cholesterol or heart diet', 'LOW'], ['Pregnancy or feeding diet', 'LOW'], ['Child nutrition', 'LOW'], ['Sports nutrition', 'LOW'], ['Weekly review', 'LOW'], ['Follow-up visit', 'LOW'], ['Report review', 'LOW']];
+export const SEVERITY_RANK ={ LOW: 1, MEDIUM: 2, HIGH: 3 };
 export const worst = (list) => list.reduce((w, x) => (SEVERITY_RANK[x] > SEVERITY_RANK[w] ? x : w), 'LOW');
 // the hospital's own list, in the order the Admin set; a hospital that has none yet gets the defaults
 export async function hospitalReasons(hospitalId, db = pool) {
   let q = await db.query('SELECT name,severity FROM booking_reasons WHERE hospital_id=$1 ORDER BY position,id', [hospitalId]);
   if (!q.rowCount) {
-    for (const [i, [name, severity]] of DEFAULT_REASONS.entries()) {
+    const docs = (await db.query(`SELECT COUNT(*) FILTER (WHERE speciality='DIETITIAN')::int AS diet,COUNT(*) FILTER (WHERE speciality IS DISTINCT FROM 'DIETITIAN')::int AS others
+                                  FROM users WHERE hospital_id=$1 AND role='DOCTOR' AND is_active=TRUE AND deleted_at IS NULL`, [hospitalId])).rows[0];
+    const starter = docs.diet > 0 && docs.others === 0 ? DIET_REASONS : DEFAULT_REASONS;
+    for (const [i, [name, severity]] of starter.entries()) {
       await db.query('INSERT INTO booking_reasons(hospital_id,name,severity,position) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING', [hospitalId, name, severity, i + 1]);
     }
     q = await db.query('SELECT name,severity FROM booking_reasons WHERE hospital_id=$1 ORDER BY position,id', [hospitalId]);
@@ -51,20 +56,20 @@ router.use((req, res, next) => {
 });
 
 // the form carries a stamp from the server, so a bot that posts at once is turned away
-const makeStamp = () => { const t = Date.now(); return `${t}.${hash(`form:${t}`).slice(0, 32)}`; };
-function checkStamp(stamp) {
+export const makeStamp = () => { const t = Date.now(); return `${t}.${hash(`form:${t}`).slice(0, 32)}`; };
+export function checkStamp(stamp) {
   const [t, sig] = String(stamp || '').split('.');
   if (!t || !sig || sig !== hash(`form:${t}`).slice(0, 32)) return false;
   const age = Date.now() - Number(t);
   return age >= MIN_FILL_MS && age <= MAX_FILL_MS;
 }
 
-const captchaSecret = () => String(process.env.TURNSTILE_SECRET || '').trim();
-const captchaSiteKey = () => String(process.env.TURNSTILE_SITE_KEY || '').trim();
+export const captchaSecret = () => String(process.env.TURNSTILE_SECRET || '').trim();
+export const captchaSiteKey = () => String(process.env.TURNSTILE_SITE_KEY || '').trim();
 // online booking needs the captcha in production; in development it is skipped
-const captchaReady = () => (captchaSecret() && captchaSiteKey()) || !isProduction();
+export const captchaReady = () => (captchaSecret() && captchaSiteKey()) || !isProduction();
 
-async function verifyCaptcha(token, ip) {
+export async function verifyCaptcha(token, ip) {
   if (!captchaSecret()) return true; // development only: captchaReady() blocks production without it
   if (!token) return false;
   try {

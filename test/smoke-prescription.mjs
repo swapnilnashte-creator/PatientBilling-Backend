@@ -2,6 +2,7 @@
 //   node --env-file=.env test/smoke-prescription.mjs
 // It registers a throw-away hospital, exercises the medicine search and prescription endpoints, then deletes it.
 import { pool } from '../src/db.js';
+import { hospitalTablesInDeleteOrder } from '../src/hospitalPurge.js';
 
 const API = process.env.API_URL || 'http://localhost:4000/api';
 const out = [];
@@ -83,9 +84,8 @@ try {
   out.push(`CRASH | ${error.stack}`);
 } finally {
   try {
-    await pool.query('DELETE FROM visit_prescription_items WHERE hospital_id=$1', [hospitalId]);
-    for (const table of ['visit_doctors', 'visits', 'patients', 'billing_items', 'users']) await pool.query(`DELETE FROM ${table} WHERE hospital_id=$1`, [hospitalId]);
-    await pool.query('DELETE FROM hospital_visit_counters WHERE hospital_id=$1', [hospitalId]);
+    // every table with a hospital_id, children first (so tables added later, like the prescription change record, are included)
+    for (const table of await hospitalTablesInDeleteOrder(pool)) await pool.query(`DELETE FROM "${table}" WHERE hospital_id=$1`, [hospitalId]);
     await pool.query('DELETE FROM hospitals WHERE id=$1', [hospitalId]);
   } catch (error) { out.push(`FAIL | cleanup | ${error.message}`); }
   await pool.end();
